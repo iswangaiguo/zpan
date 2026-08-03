@@ -65,6 +65,9 @@ jobs:
         with:
           repository: saltbo/zpan
           ref: ${{ steps.release.outputs.version }}
+          
+      - name: Adapt to Workers Free cron limit
+        run: sed -i 's/, "0 \*\/12 \* \* \*"//' wrangler.toml
 
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v6
