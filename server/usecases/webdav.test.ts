@@ -471,7 +471,7 @@ describe('webdav usecase', () => {
 
   describe('putWebDavFile', () => {
     const putParams = (overrides: Partial<Parameters<typeof putWebDavFile>[1]> = {}) => ({
-      orgId: 'ws-1',
+      orgId: 'ws1',
       userId: 'u1',
       target: target(),
       fileName: 'new.txt',
@@ -479,6 +479,7 @@ describe('webdav usecase', () => {
       contentType: 'text/plain',
       contentLength: 9 as number | null,
       body: new Uint8Array(9),
+      createdBy: { type: 'api_key' as const, ref: 'key-1', issuer: null },
       ...overrides,
     })
 
@@ -489,13 +490,24 @@ describe('webdav usecase', () => {
 
     it('creates a new file matter and returns 201', async () => {
       const create = vi.fn(async () => file('new'))
-      const putObject = vi.fn(async () => 9)
+      const putObject = vi.fn(async (..._args: Parameters<S3Gateway['putObject']>) => 9)
       const deps = makeDeps({ matter: { create }, s3: { putObject } })
       const out = await putWebDavFile(deps, putParams())
       expect(out).toEqual({ ok: true, status: 201, matterId: 'new', storageId: 'st-1', bytes: 9 })
-      expect(putObject).toHaveBeenCalledWith(storage, expect.any(String), expect.any(Uint8Array), 'text/plain', 9)
+      const storageKey = putObject.mock.calls[0]?.[1]
+      expect(storageKey).toMatch(/^ws1\/u1\/\d{8}\/[A-Za-z0-9]{17}\.txt$/)
+      expect(putObject).toHaveBeenCalledWith(storage, storageKey, expect.any(Uint8Array), 'text/plain', 9)
       expect(create).toHaveBeenCalledWith(
-        expect.objectContaining({ name: 'new.txt', size: 9, dirtype: DirType.FILE, status: 'active' }),
+        expect.objectContaining({
+          name: 'new.txt',
+          size: 9,
+          dirtype: DirType.FILE,
+          status: 'active',
+          object: storageKey,
+          createdByActorType: 'api_key',
+          createdByActorRef: 'key-1',
+          createdByActorIssuer: null,
+        }),
       )
     })
 
@@ -507,7 +519,7 @@ describe('webdav usecase', () => {
       const out = await putWebDavFile(deps, putParams({ target: target({ matter: existing }), contentLength: 5 }))
       expect(out).toEqual({ ok: true, status: 204, matterId: 'm1', storageId: 'st-1', bytes: 5 })
       // Same object key is reused (known length + existing object), so no delete.
-      expect(applyUpload).toHaveBeenCalledWith('ws-1', existing, {
+      expect(applyUpload).toHaveBeenCalledWith('ws1', existing, {
         type: 'text/plain',
         size: 5,
         object: 'objects/m1.txt',
@@ -515,12 +527,45 @@ describe('webdav usecase', () => {
       expect(deleteObject).not.toHaveBeenCalled()
     })
 
+    it('overwrites an existing object for compatible legacy owner IDs', async () => {
+      const existing = file('m1', { object: 'legacy_/existing-file-.txt', size: 20 })
+      const deps = makeDeps({ s3: { putObject: async () => 5 } })
+
+      await expect(
+        putWebDavFile(
+          deps,
+          putParams({
+            target: target({ matter: existing }),
+            contentLength: 5,
+            orgId: 'legacy_org',
+            userId: 'legacy-user',
+          }),
+        ),
+      ).resolves.toMatchObject({ ok: true, status: 204 })
+      expect(existing.object).toBe('legacy_/existing-file-.txt')
+    })
+
+    it.each([
+      ['organization ID', { orgId: 'invalid/org' }],
+      ['user ID', { userId: 'invalid:user' }],
+    ])('rejects an unsafe %s before overwriting an existing S3 object', async (component, overrides) => {
+      const putObject = vi.fn(async () => 5)
+      const existing = file('m1', { object: 'legacy_/existing-file-.txt', size: 20 })
+      const deps = makeDeps({ s3: { putObject } })
+
+      await expect(
+        putWebDavFile(deps, putParams({ target: target({ matter: existing }), contentLength: 5, ...overrides })),
+      ).rejects.toThrow(`Invalid ${component} for object storage key`)
+      expect(putObject).not.toHaveBeenCalled()
+      expect(existing.object).toBe('legacy_/existing-file-.txt')
+    })
+
     it('reconciles usage when an overwrite shrinks the file', async () => {
       const reconcile = vi.fn(async () => {})
       const existing = file('m1', { object: 'objects/m1.txt', size: 20 })
       const deps = makeDeps({ storageUsage: { reconcile }, s3: { putObject: async () => 5 } })
       await putWebDavFile(deps, putParams({ target: target({ matter: existing }), contentLength: 5 }))
-      expect(reconcile).toHaveBeenCalledWith('ws-1', ['st-1'])
+      expect(reconcile).toHaveBeenCalledWith('ws1', ['st-1'])
     })
 
     it('reserves the measured size after a streamed (no Content-Length) upload', async () => {
@@ -566,7 +611,13 @@ describe('webdav usecase', () => {
     it('creates a folder matter under the selected private storage', async () => {
       const create = vi.fn(async () => folder('Projects'))
       const deps = makeDeps({ matter: { create } })
-      await createWebDavCollection(deps, { orgId: 'ws-1', userId: 'u1', name: 'Projects', parent: 'Docs' })
+      await createWebDavCollection(deps, {
+        orgId: 'ws-1',
+        userId: 'u1',
+        name: 'Projects',
+        parent: 'Docs',
+        createdBy: { type: 'api_key', ref: 'key-1', issuer: null },
+      })
       expect(create).toHaveBeenCalledWith(
         expect.objectContaining({
           name: 'Projects',
@@ -575,6 +626,8 @@ describe('webdav usecase', () => {
           parent: 'Docs',
           object: '',
           status: 'active',
+          createdByActorType: 'api_key',
+          createdByActorRef: 'key-1',
         }),
       )
     })
@@ -670,7 +723,7 @@ describe('webdav usecase', () => {
 
   describe('copyWebDavFile', () => {
     const copyParams = (overrides: Partial<Parameters<typeof copyWebDavFile>[1]> = {}) => ({
-      orgId: 'ws-1',
+      orgId: 'ws1',
       userId: 'u1',
       sourceMatter: file('src', { size: 12 }),
       sourceResourcePath: 'src.txt',
@@ -679,20 +732,31 @@ describe('webdav usecase', () => {
       targetResourcePath: 'dst.txt',
       replacedMatterId: null,
       replacingTarget: false,
+      createdBy: { type: 'api_key' as const, ref: 'key-1', issuer: null },
       ...overrides,
     })
 
     it('copies the object + matter + dead properties and returns 201', async () => {
-      const copyObject = vi.fn(async () => {})
+      const copyObject = vi.fn(async (..._args: Parameters<S3Gateway['copyObject']>) => {})
       const copyDeadProperties = vi.fn(async () => {})
       const copy = vi.fn(async (s: Matter, parent: string, object: string) =>
         file('copy', { parent, object, name: s.name }),
       )
       const deps = makeDeps({ s3: { copyObject }, matter: { copy }, webdavState: { copyDeadProperties } })
-      const out = await copyWebDavFile(deps, copyParams())
+      const sourceMatter = file('src', { size: 12, object: 'legacy_/webdav-source-.txt' })
+      const out = await copyWebDavFile(deps, copyParams({ sourceMatter }))
       expect(out).toEqual({ ok: true, status: 201, location: 'dst.txt' })
-      expect(copyObject).toHaveBeenCalledWith(storage, 'objects/src.txt', storage, expect.any(String))
-      expect(copyDeadProperties).toHaveBeenCalledWith('ws-1', 'src.txt', 'dst.txt')
+      const destinationKey = copyObject.mock.calls[0]?.[3]
+      expect(sourceMatter.object).toBe('legacy_/webdav-source-.txt')
+      expect(destinationKey).toMatch(/^ws1\/u1\/\d{8}\/[A-Za-z0-9]{17}\.txt$/)
+      expect(copyObject).toHaveBeenCalledWith(storage, sourceMatter.object, storage, destinationKey)
+      expect(copy).toHaveBeenCalledWith(expect.any(Object), '', destinationKey, {
+        onConflict: 'fail',
+        createdByActorType: 'api_key',
+        createdByActorRef: 'key-1',
+        createdByActorIssuer: null,
+      })
+      expect(copyDeadProperties).toHaveBeenCalledWith('ws1', 'src.txt', 'dst.txt')
     })
 
     it('returns 204 and trashes the destination when overwriting', async () => {
@@ -700,7 +764,7 @@ describe('webdav usecase', () => {
       const deps = makeDeps({ matter: { trash } })
       const out = await copyWebDavFile(deps, copyParams({ replacedMatterId: 't1', replacingTarget: true }))
       expect(out).toEqual({ ok: true, status: 204, location: 'dst.txt' })
-      expect(trash).toHaveBeenCalledWith('ws-1', 't1')
+      expect(trash).toHaveBeenCalledWith('ws1', 't1')
     })
 
     it('returns storage_not_found when an object-backed source has no storage', async () => {
@@ -739,7 +803,7 @@ describe('webdav usecase', () => {
     }
 
     const collParams = (overrides: Partial<Parameters<typeof copyWebDavCollection>[1]> = {}) => ({
-      orgId: 'ws-1',
+      orgId: 'ws1',
       userId: 'u1',
       sourceMatter: folder('src', { name: 'Source' }),
       sourceRoot: 'Source',
@@ -749,14 +813,15 @@ describe('webdav usecase', () => {
       targetMatter: null,
       replacingTarget: false,
       depth: 'infinity' as const,
+      createdBy: { type: 'api_key' as const, ref: 'key-1', issuer: null },
       ...overrides,
     })
 
     it('recursively copies the root + descendants, rewriting parents and dead properties', async () => {
       const { child, grandchild } = tree()
-      const copies: Array<{ name: string; parent: string }> = []
+      const copies: Array<{ name: string; parent: string; object: string }> = []
       const copy = vi.fn(async (s: Matter, parent: string, object: string) => {
-        copies.push({ name: s.name, parent })
+        copies.push({ name: s.name, parent, object })
         return file('c', { name: s.name, parent, object })
       })
       const copyDeadProperties = vi.fn(async () => {})
@@ -770,10 +835,20 @@ describe('webdav usecase', () => {
       // Root first (renamed to the target name, matching the original), then
       // child under Copied, then grandchild under Copied/Nested.
       expect(copies).toEqual([
-        { name: 'Copied', parent: '' },
-        { name: 'Nested', parent: 'Copied' },
-        { name: 'note.txt', parent: 'Copied/Nested' },
+        { name: 'Copied', parent: '', object: '' },
+        { name: 'Nested', parent: 'Copied', object: '' },
+        {
+          name: 'note.txt',
+          parent: 'Copied/Nested',
+          object: expect.stringMatching(/^ws1\/u1\/\d{8}\/[A-Za-z0-9]{17}\.txt$/),
+        },
       ])
+      expect(copy).toHaveBeenCalledWith(expect.any(Object), '', '', {
+        onConflict: 'fail',
+        createdByActorType: 'api_key',
+        createdByActorRef: 'key-1',
+        createdByActorIssuer: null,
+      })
     })
 
     it('copies only the root when depth=0', async () => {
@@ -813,8 +888,8 @@ describe('webdav usecase', () => {
       await expect(copyWebDavCollection(deps, collParams({ targetMatter, replacingTarget: true }))).rejects.toThrow(
         'copy failed',
       )
-      expect(trashByIds).toHaveBeenCalledWith('ws-1', ['c1'])
-      expect(restoreActiveByIds).toHaveBeenCalledWith('ws-1', expect.arrayContaining(['existing']))
+      expect(trashByIds).toHaveBeenCalledWith('ws1', ['c1'])
+      expect(restoreActiveByIds).toHaveBeenCalledWith('ws1', expect.arrayContaining(['existing']))
     })
   })
 
@@ -832,6 +907,7 @@ describe('webdav usecase', () => {
         owner: 'tester',
         depth: '0',
         timeoutSeconds: 600,
+        createdBy: { type: 'api_key', ref: 'key-1', issuer: null },
       })
       expect(out).toEqual({ lock, created: false })
       expect(create).not.toHaveBeenCalled()
@@ -846,29 +922,35 @@ describe('webdav usecase', () => {
     })
 
     it('lazily creates an empty file when locking an unmapped URL (created=true)', async () => {
-      const putObject = vi.fn(async () => 0)
+      const putObject = vi.fn(async (..._args: Parameters<S3Gateway['putObject']>) => 0)
       const create = vi.fn(async () => file('new', { size: 0, type: 'application/octet-stream' }))
       const deps = makeDeps({ s3: { putObject }, matter: { create } })
       const out = await createWebDavLock(deps, {
-        orgId: 'ws-1',
+        orgId: 'ws1',
         userId: 'u1',
         resourcePath: 'new.txt',
         target: target({ matter: null, name: 'new.txt' }),
         owner: 'tester',
         depth: 'infinity',
         timeoutSeconds: 3600,
+        createdBy: { type: 'api_key', ref: 'key-1', issuer: null },
       })
       expect(out).not.toBeNull()
       if (!out) throw new Error('Expected lock to be created')
       expect(out.created).toBe(true)
-      expect(putObject).toHaveBeenCalledWith(
-        storage,
-        expect.any(String),
-        expect.any(Uint8Array),
-        'application/octet-stream',
-      )
+      const storageKey = putObject.mock.calls[0]?.[1]
+      expect(storageKey).toMatch(/^ws1\/u1\/\d{8}\/[A-Za-z0-9]{17}\.txt$/)
+      expect(putObject).toHaveBeenCalledWith(storage, storageKey, expect.any(Uint8Array), 'application/octet-stream')
       expect(create).toHaveBeenCalledWith(
-        expect.objectContaining({ name: 'new.txt', size: 0, dirtype: DirType.FILE, status: 'active' }),
+        expect.objectContaining({
+          name: 'new.txt',
+          size: 0,
+          dirtype: DirType.FILE,
+          status: 'active',
+          object: storageKey,
+          createdByActorType: 'api_key',
+          createdByActorRef: 'key-1',
+        }),
       )
     })
   })

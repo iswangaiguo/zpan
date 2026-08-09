@@ -319,7 +319,7 @@ describe('Download tasks API integration', () => {
     expect(new Set(ids)).toHaveLength(3)
   })
 
-  it('uses the API key owner UID in the object storage key', async () => {
+  it('uses the API key owner UID in the object storage key [spec: download-tasks/actor-attribution]', async () => {
     const { app, db } = await createTestApp({ DOWNLOAD_TOKEN_SECRET: 'test-download-token-secret' })
     await insertStorage(db)
     const admin = await adminHeaders(app)
@@ -359,9 +359,18 @@ describe('Download tasks API integration', () => {
     expect(createTaskRes.status).toBe(201)
     const task = (await createTaskRes.json()) as DownloadTask
     expect(task.createdBy).toBe(identity.userId)
+    expect(task.requestedBy).toMatchObject({ type: 'api_key', name: 'API key · storage-key-owner', resolved: true })
 
     const downloader = await registerDownloaderThroughDeviceLogin(app, 'api-key-storage-downloader', admin)
     const assigned = await claimTaskForDownloader(app, downloader.token, task.id)
+    const detailRes = await app.request(`/api/downloads/tasks/${task.id}`, { headers: userHeaders })
+    expect(detailRes.status).toBe(200)
+    const detail = (await detailRes.json()) as DownloadTask
+    expect(detail.status.assignment?.executor).toMatchObject({
+      type: 'device',
+      name: 'Device · api-key-storage-downloader',
+      resolved: true,
+    })
     const uploadToken = assigned.status.assignment?.uploadToken
     expect(uploadToken).toBeTruthy()
 
@@ -380,7 +389,11 @@ describe('Download tasks API integration', () => {
     const rows = await db.all<{ objectKey: string }>(
       sql`SELECT object AS objectKey FROM matters WHERE id = ${object.id}`,
     )
-    expect(rows[0]?.objectKey).toMatch(new RegExp(`^${identity.orgId}/${identity.userId}/\\d{8}/`))
+    expect(identity.orgId).toMatch(/^[A-Za-z0-9]+$/)
+    expect(identity.userId).toMatch(/^[A-Za-z0-9]+$/)
+    expect(rows[0]?.objectKey).toMatch(
+      new RegExp(`^${identity.orgId}/${identity.userId}/\\d{8}/[A-Za-z0-9]{17}\\.txt$`),
+    )
     expect(rows[0]?.objectKey).not.toContain('api-key:')
   })
 
@@ -1061,6 +1074,18 @@ describe('Download tasks API integration', () => {
     expect(confirmRes.status).toBe(200)
     const confirmed = (await confirmRes.json()) as { id: string; status: string }
     expect(confirmed.status).toBe('active')
+    const uploadAudit = await db.all<{ actorType: string; actorRef: string | null; userId: string | null }>(sql`
+      SELECT actor_type AS actorType, actor_ref AS actorRef, user_id AS userId
+      FROM audit_events
+      WHERE action = 'upload_confirm' AND target_id = ${object.id}
+    `)
+    expect(uploadAudit).toEqual([
+      {
+        actorType: 'device',
+        actorRef: createdDownloader.downloader.id,
+        userId: createdTask.createdBy,
+      },
+    ])
 
     const uploadingRes = await app.request(`/api/downloads/tasks/${createdTask.id}`, {
       method: 'PATCH',

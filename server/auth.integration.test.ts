@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { AuthorizationScope } from '@shared/authorization'
+import { BASE62_PATTERN } from '@shared/ids'
 import { WORKSPACE_AUTHORIZATION_DETAIL_TYPE } from '@shared/oauth'
 import { isPersonalOrgLike } from '@shared/org-slugs'
 import { deriveDpopAth } from 'better-auth/oauth2'
@@ -11,7 +12,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createInviteRepo } from './adapters/repos/invite.js'
 import { createSiteInvitationRepo } from './adapters/repos/site-invitations.js'
 import { createApp } from './app.js'
-import { createAuth } from './auth.js'
+import { createAuth, officialWorkersPreviewOrigin } from './auth.js'
 import * as authSchema from './db/auth-schema.js'
 import * as schema from './db/schema.js'
 import { inviteCodes, siteInvitations } from './db/schema.js'
@@ -74,6 +75,83 @@ async function personalOrgForUser(ctx: TestCtx, userId: string): Promise<string>
 }
 
 describe('registration gate — first user always allowed', () => {
+  it('Better Auth persists only Base62 database IDs and session tokens', async () => {
+    const ctx = await createTestApp()
+    const response = await signUp(ctx, 'base62-contract@example.com')
+    expect(response.status).toBe(200)
+    const cookie = response.headers.getSetCookie().join('; ')
+    expect(cookie).toBeTruthy()
+    const createdOrganization = await ctx.app.request('/api/auth/organization/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cookie!, Origin: 'http://localhost:3000' },
+      body: JSON.stringify({ name: 'Base62 Team', slug: 'base62-team', metadata: { type: 'team' } }),
+    })
+    expect(createdOrganization.status).toBe(200)
+    const organization = (await createdOrganization.json()) as { id: string }
+    const createdInvitation = await ctx.app.request('/api/auth/organization/invite-member', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cookie!, Origin: 'http://localhost:3000' },
+      body: JSON.stringify({
+        email: 'base62-invitee@example.com',
+        role: 'member',
+        organizationId: organization.id,
+      }),
+    })
+    expect(createdInvitation.status).toBe(200)
+    const [invitation] = await ctx.db.select({ id: authSchema.invitation.id }).from(authSchema.invitation)
+    expect(invitation).toBeTruthy()
+
+    const inviteeResponse = await signUp(ctx, 'base62-invitee@example.com')
+    expect(inviteeResponse.status).toBe(200)
+    const invitee = (await inviteeResponse.clone().json()) as { user: { id: string } }
+    await ctx.db.update(authSchema.user).set({ emailVerified: true }).where(eq(authSchema.user.id, invitee.user.id))
+    const inviteeSignIn = await ctx.app.request('/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'base62-invitee@example.com', password: 'password123456' }),
+    })
+    expect(inviteeSignIn.status).toBe(200)
+    const inviteeCookie = inviteeSignIn.headers.getSetCookie().join('; ')
+    const acceptedInvitation = await ctx.app.request('/api/auth/organization/accept-invitation', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: inviteeCookie, Origin: 'http://localhost:3000' },
+      body: JSON.stringify({ invitationId: invitation.id }),
+    })
+    expect(acceptedInvitation.status).toBe(200)
+
+    const values = [
+      ...(await ctx.db.select({ id: authSchema.user.id }).from(authSchema.user)),
+      ...(await ctx.db.select({ id: authSchema.account.id }).from(authSchema.account)),
+      ...(await ctx.db.select({ id: authSchema.organization.id }).from(authSchema.organization)),
+      ...(await ctx.db.select({ id: authSchema.member.id }).from(authSchema.member)),
+      ...(await ctx.db.select({ id: authSchema.invitation.id }).from(authSchema.invitation)),
+      ...(await ctx.db.select({ id: authSchema.session.id }).from(authSchema.session)),
+    ]
+    expect(values.length).toBeGreaterThan(0)
+    for (const { id } of values) expect(id).toMatch(BASE62_PATTERN)
+    for (const { token } of await ctx.db.select({ token: authSchema.session.token }).from(authSchema.session)) {
+      expect(token).toMatch(BASE62_PATTERN)
+    }
+  })
+
+  it('creates only Base62 API keys and rejects punctuation in caller prefixes', async () => {
+    const ctx = await createTestApp()
+    await signUp(ctx, 'base62-api-key@example.com')
+    const [user] = await ctx.db.select({ id: authSchema.user.id }).from(authSchema.user)
+    const api = ctx.auth.api as unknown as {
+      createApiKey(input: { body: Record<string, unknown> }): Promise<{ key: string }>
+    }
+
+    const created = await api.createApiKey({
+      body: { configId: 'webdav', userId: user.id, prefix: 'ZPan' },
+    })
+    expect(created.key).toMatch(BASE62_PATTERN)
+    expect(created.key).toHaveLength(68)
+    await expect(
+      api.createApiKey({ body: { configId: 'webdav', userId: user.id, prefix: 'zpan_key-' } }),
+    ).rejects.toThrow('API key prefixes must contain only ASCII letters and digits')
+  })
+
   it('first user can register when auth_signup_mode is closed', async () => {
     const ctx = await createTestApp()
     await ctx.db.insert(schema.systemOptions).values({ key: 'auth_signup_mode', value: 'closed' })
@@ -233,7 +311,7 @@ describe('registration gate — invite_only mode', () => {
     const ctx = await createTestApp()
     await ctx.db.insert(schema.systemOptions).values({ key: 'auth_signup_mode', value: 'invite_only' })
     await signUp(ctx, 'first@example.com')
-    const res = await signUp(ctx, 'badinvite@example.com', { inviteCode: 'BADCODE1' })
+    const res = await signUp(ctx, 'badinvite@example.com', { inviteCode: 'BADCODE001' })
     expect(res.status).not.toBe(200)
   })
 
@@ -800,6 +878,29 @@ describe('Cloudflare Workers preview auth origins', () => {
     }
   })
 
+  it('reads a session without signing an implicit JWT', async () => {
+    const ctx = await createTestApp()
+    await ctx.auth.api.getJwks()
+    await signUp(ctx, 'preview-session@example.com')
+    const [session] = await ctx.db.select({ token: authSchema.session.token }).from(authSchema.session).limit(1)
+    if (!session) throw new Error('sign-up did not create a session')
+
+    const previewAuth = await createAuth(
+      ctx.platform,
+      'different-preview-secret-that-is-at-least-32-bytes',
+      configuredOrigin,
+      [configuredOrigin],
+    )
+    const previewApp = createApp(ctx.platform, previewAuth)
+    const response = await previewApp.request(`${commitOrigin}/api/auth/get-session`, {
+      headers: { Authorization: `Bearer ${session.token}` },
+    })
+
+    expect(response.status, await response.clone().text()).toBe(200)
+    expect(response.headers.has('set-auth-jwt')).toBe(false)
+    await expect(response.json()).resolves.toMatchObject({ user: { email: 'preview-session@example.com' } })
+  })
+
   it('rejects unrelated workers.dev origins', async () => {
     const ctx = await createTestApp()
     const auth = await createAuth(ctx.platform, 'test-secret', configuredOrigin, [configuredOrigin])
@@ -816,6 +917,44 @@ describe('Cloudflare Workers preview auth origins', () => {
 })
 
 describe('OAuth consent guards', () => {
+  it('rejects malformed dynamic registration JSON without trusting its origin', async () => {
+    const ctx = await createTestApp()
+    const response = await ctx.app.request('/api/auth/oauth2/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{',
+    })
+
+    expect(response.status).toBeGreaterThanOrEqual(400)
+  })
+
+  it('rejects invalid dynamic registration URLs without trusting their origin', async () => {
+    const ctx = await createTestApp()
+    const response = await ctx.app.request('/api/auth/oauth2/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_name: 'Invalid Resource Broker',
+        redirect_uris: ['not-a-url'],
+        grant_types: [
+          'authorization_code',
+          'refresh_token',
+          'urn:ietf:params:oauth:grant-type:jwt-bearer',
+          'urn:ietf:params:oauth:grant-type:token-exchange',
+        ],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'client_secret_basic',
+        jwks_uri: 'also-not-a-url',
+      }),
+    })
+
+    expect(response.status).toBeGreaterThanOrEqual(400)
+  })
+
+  it('does not trust malformed Workers preview origins', () => {
+    expect(officialWorkersPreviewOrigin('https://zpan-staging.account.workers.dev', 'not-a-url')).toBeNull()
+  })
+
   it('publishes the external resource discovery contract at the exact API URL', async () => {
     const ctx = await createTestApp()
     const resource = await ctx.app.request('http://localhost:3000/api')
@@ -839,6 +978,7 @@ describe('OAuth consent guards', () => {
       registration_endpoint: 'http://localhost:3000/api/auth/oauth2/register',
       authorization_details_catalog_endpoint: 'http://localhost:3000/api/auth/oauth2/authorization-details/catalog',
       authorization_details_catalog_scope: AuthorizationScope.WORKSPACES_DISCOVER,
+      authorization_details_catalog_version: 1,
       grant_types_supported: expect.arrayContaining([
         'urn:ietf:params:oauth:grant-type:jwt-bearer',
         'urn:ietf:params:oauth:grant-type:token-exchange',
@@ -874,7 +1014,7 @@ describe('OAuth consent guards', () => {
     expect(body).toMatchObject({
       client_id: expect.any(String),
       client_secret: expect.any(String),
-      registration_access_token: expect.stringMatching(/^zpr_/),
+      registration_access_token: expect.stringMatching(/^[A-Za-z0-9]{43}$/),
       registration_client_uri: expect.stringMatching(/^http:\/\/localhost:3000\/api\/auth\/oauth2\/register\//),
       token_endpoint_auth_method: 'client_secret_basic',
       authorization_details_types: [WORKSPACE_AUTHORIZATION_DETAIL_TYPE],
@@ -899,6 +1039,63 @@ describe('OAuth consent guards', () => {
         }),
       ]),
     )
+  })
+
+  it('allows loopback HTTP JWKS metadata for local dynamic registration', async () => {
+    const ctx = await createTestApp()
+    const res = await ctx.app.request('/api/auth/oauth2/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_name: 'Local External Resource Broker',
+        redirect_uris: ['http://localhost:4179/api/account-connections/oauth/callback'],
+        grant_types: [
+          'authorization_code',
+          'refresh_token',
+          'urn:ietf:params:oauth:grant-type:jwt-bearer',
+          'urn:ietf:params:oauth:grant-type:token-exchange',
+        ],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'client_secret_basic',
+        scope: 'openid offline_access',
+        jwks_uri: 'http://localhost:4179/api/auth/jwks',
+        authorization_details_types: [WORKSPACE_AUTHORIZATION_DETAIL_TYPE],
+      }),
+    })
+
+    expect(res.status, await res.clone().text()).toBe(201)
+  })
+
+  it('rejects loopback HTTP JWKS metadata on a non-loopback server', async () => {
+    const ctx = await createTestApp()
+    const origin = 'https://drive.example.com'
+    const auth = await createAuth(ctx.platform, 'test-secret', origin, [origin])
+    const app = createApp(ctx.platform, auth)
+    const res = await app.request(`${origin}/api/auth/oauth2/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_name: 'Unsafe Loopback Broker',
+        redirect_uris: ['https://broker.example.com/api/account-connections/oauth/callback'],
+        grant_types: [
+          'authorization_code',
+          'refresh_token',
+          'urn:ietf:params:oauth:grant-type:jwt-bearer',
+          'urn:ietf:params:oauth:grant-type:token-exchange',
+        ],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'client_secret_basic',
+        scope: 'openid offline_access',
+        jwks_uri: 'http://localhost:4179/api/auth/jwks',
+        authorization_details_types: [WORKSPACE_AUTHORIZATION_DETAIL_TYPE],
+      }),
+    })
+
+    expect(res.status).toBe(400)
+    await expect(res.json()).resolves.toMatchObject({
+      error: 'invalid_client_metadata',
+      error_description: 'jwks_uri must use HTTPS',
+    })
   })
 
   it('reads, replaces, and deletes a dynamic client through its RFC 7592 configuration endpoint', async () => {
@@ -1023,7 +1220,7 @@ describe('OAuth consent guards', () => {
     })
   })
 
-  it('returns a DPoP challenge for a foreign access token instead of an internal error', async () => {
+  it('returns the standard invalid-token challenge for a foreign access token instead of an internal error', async () => {
     const ctx = await createTestApp()
     const apiUrl = 'http://localhost:3000/api/objects'
     const { privateKey: foreignPrivateKey } = await generateKeyPair('ES256')
@@ -1070,7 +1267,8 @@ describe('OAuth consent guards', () => {
     })
 
     expect(response.status).toBe(401)
-    expect(response.headers.get('www-authenticate')).toContain('DPoP')
+    expect(response.headers.get('request-id')).toMatch(/^[0-9a-f-]{36}$/)
+    expect(response.headers.get('www-authenticate')).toContain('Bearer')
     expect(response.headers.get('www-authenticate')).toContain('/.well-known/oauth-protected-resource/api')
   })
 

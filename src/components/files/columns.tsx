@@ -1,6 +1,7 @@
 import { DirType } from '@shared/constants'
 import type { StorageObject } from '@shared/types'
 import type { ColumnDef, Row } from '@tanstack/react-table'
+import { ActorAvatarHoverCard } from '@/components/actor-identity'
 import { Checkbox } from '@/components/ui/checkbox'
 import { formatDate, formatSize } from '@/lib/format'
 import { FileIcon } from './file-icon'
@@ -16,17 +17,6 @@ function foldersFirstSort(rowA: Row<StorageObject>, rowB: Row<StorageObject>): n
 
 interface ColumnOptions {
   selectionEnabled?: boolean
-}
-
-function hasRowActions(handlers: FileActionHandlers) {
-  return !!(
-    handlers.onDownload ||
-    handlers.onRename ||
-    handlers.onCopy ||
-    handlers.onMove ||
-    handlers.onShare ||
-    handlers.onTrash
-  )
 }
 
 export function getColumns(
@@ -99,20 +89,26 @@ export function getColumns(
         if (folderOrder !== 0) return folderOrder
         return new Date(rowA.getValue<string>(columnId)).getTime() - new Date(rowB.getValue<string>(columnId)).getTime()
       },
-      size: 160,
-      meta: { className: 'hidden md:table-cell' },
+      size: 128,
+      meta: { className: 'hidden truncate md:table-cell' },
+    },
+    {
+      id: 'createdBy',
+      header: t('files.colCreatedBy'),
+      cell: ({ row }) => <ActorAvatarHoverCard actor={row.original.createdBy} />,
+      size: 64,
+      meta: { className: 'hidden text-center lg:table-cell' },
+      enableSorting: false,
     },
   ]
 
-  if (hasRowActions(handlers)) {
-    columns.push({
-      id: 'actions',
-      cell: ({ row }) => <FileRowActions item={row.original} handlers={handlers} />,
-      size: 48,
-      enableSorting: false,
-      meta: { className: 'pr-2 text-right' },
-    })
-  }
+  columns.push({
+    id: 'actions',
+    cell: ({ row }) => <FileRowActions item={row.original} handlers={handlers} />,
+    size: 48,
+    enableSorting: false,
+    meta: { className: 'pr-2 text-right' },
+  })
 
   return columns
 }

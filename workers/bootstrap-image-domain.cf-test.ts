@@ -38,7 +38,7 @@ describe('[CF] image-domain Worker fast path', () => {
 
   it('serves repeated custom-domain requests without initializing Better Auth', async () => {
     const suffix = Date.now().toString(36)
-    const orgId = `fast-path-org-${suffix}`
+    const orgId = `fast_path-org-${suffix}`
     const domain = `img-${suffix}.fast-path.test`
     const now = Date.now()
 

@@ -1,4 +1,8 @@
 import { z } from 'zod'
+import { opaqueIdSchema } from './id'
+
+export type { ActorAttribution, ActorType } from './actors'
+export { actorAttributionSchema, actorTypeSchema } from './actors'
 
 export {
   adminAnalyticsGrowthSchema,
@@ -147,6 +151,7 @@ export {
   errorInfoSchema,
   errorResponseSchema,
 } from './errors'
+export { base62IdSchema, imageTokenSchema, opaqueIdSchema, opaqueTokenSchema, shareTokenSchema } from './id'
 export type { ListNotificationsQuery } from './notification'
 export { listNotificationsQuerySchema } from './notification'
 export type { WorkspaceAuthorizationDetail } from './oauth-authorization'
@@ -279,16 +284,18 @@ export const signUpSchema = z.object({
 export const conflictStrategySchema = z.enum(['fail', 'rename', 'replace'])
 export type ConflictStrategy = z.infer<typeof conflictStrategySchema>
 
+const matterParentPathSchema = z
+  .string()
+  .describe('Slash-delimited parent folder path relative to the workspace root; use an empty string for the root.')
+
 export const createMatterSchema = z.object({
   name: z.string().min(1),
   type: z.string().min(1).optional(),
   size: z.number().int().min(0).optional(),
-  parent: z.string().default(''),
+  parent: matterParentPathSchema.default(''),
   dirtype: z.number().int().default(0),
   onConflict: conflictStrategySchema.optional(),
-  storageId: z
-    .string()
-    .min(1)
+  storageId: opaqueIdSchema
     .describe(
       'Only site administrators may set this field; omit it to let ZPan automatically select an available storage.',
     )
@@ -300,7 +307,7 @@ export type CreateMatterInput = z.infer<typeof createMatterSchema>
 export const updateMatterSchema = z.object({
   action: z.literal('update').optional().default('update'),
   name: z.string().min(1).optional(),
-  parent: z.string().optional(),
+  parent: matterParentPathSchema.optional(),
   onConflict: conflictStrategySchema.optional(),
 })
 
@@ -348,7 +355,7 @@ export const objectUploadWorkflowSchema = z.object({
 // still go directly to presigned S3 URLs; the server exposes stable part
 // identities so automation never infers part numbers from URL positions.
 export const objectUploadInstructionsSchema = z.object({
-  sessionId: z.string(),
+  sessionId: opaqueIdSchema,
   uploadId: z.string().nullable(),
   mode: z.enum(['single', 'multipart']),
   partSize: z.number().int(),
@@ -404,7 +411,7 @@ export const copyObjectBodySchema = z.object({
 export type CopyObjectBodyInput = z.infer<typeof copyObjectBodySchema>
 
 export const transferMatterSchema = z.object({
-  targetOrgId: z.string().min(1),
+  targetOrgId: opaqueIdSchema,
   targetParent: z.string().default(''),
   mode: z.enum(['copy', 'move']),
 })

@@ -1,12 +1,14 @@
 import { OpenAPIHono, z } from '@hono/zod-openapi'
 import { AuthorizationScope } from '@shared/authorization'
 import {
+  actorAttributionSchema,
   completeObjectUploadSchema,
   copyObjectBodySchema,
   createMatterSchema,
   cursorPageQuerySchema,
   cursorPageSchema,
   objectUploadInstructionsSchema,
+  opaqueIdSchema,
   patchMatterSchema,
   presignObjectUploadPartsResponseSchema,
   presignObjectUploadPartsSchema,
@@ -28,11 +30,12 @@ import {
   type ObjectActor,
   ObjectUploadSessionError,
   presignUploadSessionParts,
+  resolveMatterCreators,
   transferObject,
   trashObject,
   updateObject,
 } from '../usecases/object'
-import { badRequest, forbidden, type Matter, type MatterListItem, quotaExceeded } from '../usecases/ports'
+import { badRequest, forbidden, type Matter, type MatterListItem, quotaExceeded, unauthorized } from '../usecases/ports'
 import { describeCapacityRequirement } from '../usecases/store/store'
 import { recordDownloadIssued } from '../usecases/transfer-activity'
 import { authRoute, errorResponse, jsonBody, jsonContent } from './openapi'
@@ -45,18 +48,21 @@ import { decodeOptionalPageToken, directoryCursorCodec, encodeNextPageToken, pag
 // OpenAPI document and SDKs derive the `Matter` model from.
 const matterSchema = z
   .object({
-    id: z.string(),
-    orgId: z.string(),
+    id: opaqueIdSchema,
+    orgId: opaqueIdSchema,
     alias: z.string(),
     name: z.string(),
     type: z.string(),
     size: z.number().int().nullable(),
     dirtype: z.number().int().nullable(),
-    parent: z.string(),
+    parent: z
+      .string()
+      .describe('Slash-delimited parent folder path relative to the workspace root; empty for root objects.'),
     object: z.string(),
-    storageId: z.string(),
+    storageId: opaqueIdSchema,
     status: z.string(),
     trashedAt: z.number().int().nullable(),
+    createdBy: actorAttributionSchema.nullable(),
     createdAt: z.string(),
     updatedAt: z.string(),
   })
@@ -68,7 +74,7 @@ type MatterDTO = z.infer<typeof matterSchema>
 // timestamps to ISO strings, pass everything else through. Its return type is the
 // schema's inferred type, so a drift between `Matter` and `matterSchema` is a
 // compile error — not a silent lie in the document.
-function toMatterDTO(m: Matter): MatterDTO {
+function toMatterDTO(m: Matter, createdBy: MatterDTO['createdBy']): MatterDTO {
   return {
     id: m.id,
     orgId: m.orgId,
@@ -82,6 +88,7 @@ function toMatterDTO(m: Matter): MatterDTO {
     storageId: m.storageId,
     status: m.status,
     trashedAt: m.trashedAt,
+    createdBy,
     createdAt: m.createdAt.toISOString(),
     updatedAt: m.updatedAt.toISOString(),
   }
@@ -93,11 +100,18 @@ export async function createCapacityRequestHash(orgId: string, input: unknown): 
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
-const objectListItemSchema = matterSchema.extend({ hasChildren: z.boolean() }).openapi('ObjectListItem')
+const objectListItemSchema = matterSchema
+  .extend({ hasChildren: z.boolean().describe('Whether this folder contains at least one child folder.') })
+  .openapi('ObjectListItem')
 type ObjectListItemDTO = z.infer<typeof objectListItemSchema>
 
-function toObjectListItemDTO(item: MatterListItem): ObjectListItemDTO {
-  return { ...toMatterDTO(item), hasChildren: item.hasChildren }
+function toObjectListItemDTO(item: MatterListItem, createdBy: MatterDTO['createdBy']): ObjectListItemDTO {
+  return { ...toMatterDTO(item, createdBy), hasChildren: item.hasChildren }
+}
+
+async function matterDTO(deps: Env['Variables']['deps'], matter: Matter): Promise<MatterDTO> {
+  const creators = await resolveMatterCreators(deps, [matter])
+  return toMatterDTO(matter, creators.get(matter.id) ?? null)
 }
 
 const objectPageSchema = cursorPageSchema(objectListItemSchema, 'ObjectPage')
@@ -142,15 +156,21 @@ const objectWithDownloadSchema = matterSchema.extend({ downloadUrl: z.string().o
 // overrides the shared pageSize cap of 100 with a higher ceiling — the rest of the
 // API keeps the 100 default. Live objects only — the recycle bin is GET /trash/objects.
 const listObjectsQuerySchema = cursorPageQuerySchema.extend({
-  parent: z.string().optional(),
-  path: z.string().optional(),
+  parent: z
+    .string()
+    .describe('Slash-delimited parent folder path relative to the workspace root; empty for the root.')
+    .optional(),
+  path: z
+    .string()
+    .describe('Alias for parent: the slash-delimited parent folder path relative to the workspace root.')
+    .optional(),
   type: z.string().optional(),
   search: z.string().optional(),
-  orgId: z.string().optional(),
+  orgId: opaqueIdSchema.optional(),
 })
 
-const idParam = z.object({ id: z.string() })
-const sessionParams = z.object({ id: z.string(), uploadSessionId: z.string() })
+const idParam = z.object({ id: opaqueIdSchema })
+const sessionParams = z.object({ id: opaqueIdSchema, uploadSessionId: opaqueIdSchema })
 const abortUploadQuerySchema = z.object({
   strictStorageCleanup: z.enum(['1', 'true']).optional(),
 })
@@ -166,9 +186,16 @@ function objectActor(c: Context<Env>): ObjectActor {
       taskId: principal.taskId,
       targetFolder: principal.targetFolder,
       createdByUserId: principal.createdByUserId,
+      identity: { type: 'device', ref: principal.downloaderId, issuer: null },
     }
   }
-  return { kind: 'user', userId: c.get('userId') as string }
+  const actor = c.get('authzContext').actor
+  if (!actor) throw unauthorized()
+  return {
+    kind: 'user',
+    userId: c.get('userId') as string,
+    identity: { type: actor.type, ref: actor.ref, issuer: 'issuer' in actor ? actor.issuer : null },
+  }
 }
 
 // The id recorded in matter/activity logs.
@@ -445,9 +472,10 @@ const objects = app
       },
     })
     if (!result.ok) throw result.error
+    const creators = await resolveMatterCreators(c.get('deps'), result.result.items)
     return c.json(
       {
-        items: result.result.items.map(toObjectListItemDTO),
+        items: result.result.items.map((item) => toObjectListItemDTO(item, creators.get(item.id) ?? null)),
         nextPageToken: await encodeNextPageToken(c.get('platform'), result.result.nextBoundary, {
           query: fingerprint,
           codec: directoryCursorCodec,
@@ -492,8 +520,9 @@ const objects = app
         402,
       )
     }
-    if ('upload' in result) return c.json({ ...toMatterDTO(result.matter), upload: result.upload }, 201)
-    return c.json(toMatterDTO(result.matter), 201)
+    const matter = await matterDTO(c.get('deps'), result.matter)
+    if ('upload' in result) return c.json({ ...matter, upload: result.upload }, 201)
+    return c.json(matter, 201)
   })
   .openapi(presignPartsRoute, async (c) => {
     const orgId = c.get('orgId')
@@ -531,7 +560,7 @@ const objects = app
       if ('error' in result) throw result.error // quota exceeded
       throw new ObjectUploadSessionError('not_found') // draft gone
     }
-    return c.json(toMatterDTO(result.matter), 200)
+    return c.json(await matterDTO(c.get('deps'), result.matter), 200)
   })
   .openapi(abortUploadRoute, async (c) => {
     const orgId = c.get('orgId')
@@ -574,9 +603,9 @@ const objects = app
           },
           result.receipt.trafficEventId,
         )
-        return c.json({ ...toMatterDTO(result.matter), downloadUrl: result.downloadUrl }, 200)
+        return c.json({ ...(await matterDTO(c.get('deps'), result.matter)), downloadUrl: result.downloadUrl }, 200)
       }
-      return c.json(toMatterDTO(result.matter), 200)
+      return c.json(await matterDTO(c.get('deps'), result.matter), 200)
     }
     throw result.error
   })
@@ -589,7 +618,7 @@ const objects = app
       input: c.req.valid('json'),
     })
     if (!result.ok) throw result.error
-    return c.json(toMatterDTO(result.matter), 200)
+    return c.json(await matterDTO(c.get('deps'), result.matter), 200)
   })
   // Soft delete: move a live object to trash. Permanent removal is
   // DELETE /trash/objects/{id}; discarding a draft is DELETE /{id}/uploads/{sid}.
@@ -611,10 +640,11 @@ const objects = app
     const result = await copyObject(c.get('deps'), {
       orgId,
       userId: c.get('userId')!,
+      actor: objectActor(c),
       input: { copyFrom: c.req.valid('param').id, parent: body.parent, onConflict: body.onConflict },
     })
     if (!result.ok) throw result.error
-    return c.json(toMatterDTO(result.matter), 201)
+    return c.json(await matterDTO(c.get('deps'), result.matter), 201)
   })
   .openapi(transferObjectRoute, async (c) => {
     const orgId = c.get('orgId')
@@ -624,13 +654,14 @@ const objects = app
     const result = await transferObject(c.get('deps'), {
       orgId,
       userId: c.get('userId')!,
+      actor: objectActor(c),
       objectId: c.req.valid('param').id,
       input: c.req.valid('json'),
     })
     if (!result.ok) throw result.error
     return c.json(
       {
-        saved: result.result.saved.map(toMatterDTO),
+        saved: await Promise.all(result.result.saved.map((matter) => matterDTO(c.get('deps'), matter))),
         skipped: result.result.skipped,
         sourceDeleted: result.result.sourceDeleted,
       },

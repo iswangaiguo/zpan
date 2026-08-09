@@ -18,7 +18,7 @@ import {
   or,
   sql,
 } from 'drizzle-orm'
-import { nanoid } from 'nanoid'
+import { generateId, generateToken } from '../../../shared/ids'
 import { matters } from '../../db/schema'
 import { type AtomicQuery, executeWriteTransaction, executeWriteTransactionWithResults } from '../../db/transaction'
 import { suggestRenamed } from '../../domain/matter-name-conflict'
@@ -297,9 +297,9 @@ export function createMatterRepo(db: Database): MatterRepo {
       const finalName = plan.finalName
 
       const row: MatterRow = {
-        id: nanoid(),
+        id: generateId(),
         orgId: input.orgId,
-        alias: nanoid(10),
+        alias: generateToken(11),
         name: finalName,
         type: input.type,
         size: input.size ?? 0,
@@ -310,6 +310,9 @@ export function createMatterRepo(db: Database): MatterRepo {
         status: input.status,
         trashedAt: null,
         purgedAt: null,
+        createdByActorType: input.createdByActorType ?? null,
+        createdByActorRef: input.createdByActorRef ?? null,
+        createdByActorIssuer: input.createdByActorIssuer ?? null,
         createdAt: now,
         updatedAt: now,
       }
@@ -508,9 +511,9 @@ export function createMatterRepo(db: Database): MatterRepo {
       )
 
       const row: MatterRow = {
-        id: nanoid(),
+        id: generateId(),
         orgId: source.orgId,
-        alias: nanoid(10),
+        alias: generateToken(11),
         name: finalName,
         type: source.type,
         size: source.size,
@@ -521,6 +524,9 @@ export function createMatterRepo(db: Database): MatterRepo {
         status: 'active',
         trashedAt: null,
         purgedAt: null,
+        createdByActorType: opts.createdByActorType ?? null,
+        createdByActorRef: opts.createdByActorRef ?? null,
+        createdByActorIssuer: opts.createdByActorIssuer ?? null,
         createdAt: now,
         updatedAt: now,
       }

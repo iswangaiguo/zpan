@@ -1,9 +1,75 @@
 import { AuthorizationScope } from '@shared/authorization'
+import { COMPATIBLE_IMAGE_TOKEN_PATTERN, COMPATIBLE_SHARE_TOKEN_PATTERN, OPAQUE_ID_PATTERN } from '@shared/ids'
 import { describe, expect, it } from 'vitest'
 import { authRoute, findOperationsMissingAuthContract } from './http/openapi'
 import { createTestApp } from './test/setup'
 
 describe('global OpenAPI document', () => {
+  it('publishes compatibility contracts for stored IDs while preserving token namespaces', async () => {
+    const { app } = await createTestApp({ DOWNLOAD_TOKEN_SECRET: 'test-download-token-secret' })
+    const res = await app.request('/api/openapi.json')
+    const doc = (await res.json()) as {
+      paths: Record<
+        string,
+        Record<
+          string,
+          {
+            parameters?: Array<{ name: string; schema?: { pattern?: string } }>
+            requestBody?: {
+              content?: {
+                'application/json'?: {
+                  schema?: {
+                    properties?: Record<string, { pattern?: string; items?: { pattern?: string } }>
+                  }
+                }
+              }
+            }
+          }
+        >
+      >
+      components?: { schemas?: Record<string, { properties?: Record<string, { pattern?: string }> }> }
+    }
+    const patternFor = (path: string, method: string, name: string) =>
+      doc.paths[path]?.[method]?.parameters?.find((parameter) => parameter.name === name)?.schema?.pattern
+    const bodyPropertyFor = (path: string, method: string, name: string) =>
+      doc.paths[path]?.[method]?.requestBody?.content?.['application/json']?.schema?.properties?.[name]
+
+    for (const path of [
+      '/api/objects',
+      '/api/shares',
+      '/api/downloads/tasks',
+      '/api/downloads/downloaders',
+      '/api/site/storages',
+    ]) {
+      expect(
+        bodyPropertyFor(path, 'post', 'id'),
+        `${path} must not accept a caller-selected primary ID`,
+      ).toBeUndefined()
+    }
+
+    expect(patternFor('/api/objects/{id}', 'get', 'id')).toBe(OPAQUE_ID_PATTERN.source)
+    expect(patternFor('/api/objects/{id}/uploads/{uploadSessionId}', 'delete', 'uploadSessionId')).toBe(
+      OPAQUE_ID_PATTERN.source,
+    )
+    expect(patternFor('/api/trash/objects/{id}', 'delete', 'id')).toBe(OPAQUE_ID_PATTERN.source)
+    expect(patternFor('/api/oauth-grants/{grantId}', 'delete', 'grantId')).toBe(OPAQUE_ID_PATTERN.source)
+    expect(patternFor('/api/site/audit-events', 'get', 'orgId')).toBe(OPAQUE_ID_PATTERN.source)
+    expect(bodyPropertyFor('/api/objects', 'post', 'storageId')?.pattern).toBe(OPAQUE_ID_PATTERN.source)
+    expect(bodyPropertyFor('/api/objects/{id}/transfers', 'post', 'targetOrgId')?.pattern).toBe(
+      OPAQUE_ID_PATTERN.source,
+    )
+    expect(bodyPropertyFor('/api/shares', 'post', 'matterId')?.pattern).toBe(OPAQUE_ID_PATTERN.source)
+    expect(bodyPropertyFor('/api/oauth-consent', 'post', 'workspaceIds')?.items?.pattern).toBe(OPAQUE_ID_PATTERN.source)
+    expect(patternFor('/api/shares/{token}', 'get', 'token')).toBe(COMPATIBLE_SHARE_TOKEN_PATTERN.source)
+    expect(patternFor('/api/shares/{token}/objects', 'get', 'token')).toBe(COMPATIBLE_SHARE_TOKEN_PATTERN.source)
+    expect(doc.components?.schemas?.ImageHosting?.properties?.token?.pattern).toBe(
+      COMPATIBLE_IMAGE_TOKEN_PATTERN.source,
+    )
+    expect(doc.components?.schemas?.ImageHostingDraft?.properties?.token?.pattern).toBe(
+      COMPATIBLE_IMAGE_TOKEN_PATTERN.source,
+    )
+  })
+
   it('aggregates every OpenAPIHono route at /api/openapi.json', async () => {
     const { app } = await createTestApp({ DOWNLOAD_TOKEN_SECRET: 'test-download-token-secret' })
     const res = await app.request('/api/openapi.json')
@@ -19,7 +85,7 @@ describe('global OpenAPI document', () => {
     expect(doc.paths['/api/objects']?.get?.tags).toContain('Objects')
     expect(doc.paths['/api/events']?.get?.tags).toContain('Events')
     expect((doc.tags ?? []).map((t) => t.name)).toEqual(
-      expect.arrayContaining(['Objects', 'Events', 'Download Tasks', 'Downloaders']),
+      expect.arrayContaining(['Objects', 'Events', 'Download Tasks', 'Downloaders', 'Downloader Device Flow']),
     )
     // Every resource already converted to `.openapi()` shows up automatically.
     expect(Object.keys(doc.paths)).toEqual(
@@ -79,6 +145,21 @@ describe('global OpenAPI document', () => {
     expect(res.headers.get('content-type')).toContain('text/html')
     const html = await res.text()
     expect(html).toContain('/api/openapi.json')
+  })
+
+  it('documents and returns the request correlation header', async () => {
+    const { app } = await createTestApp({ DOWNLOAD_TOKEN_SECRET: 'test-download-token-secret' })
+    const res = await app.request('/api/openapi.json')
+    const doc = (await res.json()) as {
+      components?: { headers?: Record<string, unknown> }
+      paths?: Record<string, { get?: { responses?: Record<string, { headers?: Record<string, unknown> }> } }>
+    }
+
+    expect(res.headers.get('Request-Id')).toMatch(/^[0-9a-f-]{36}$/)
+    expect(doc.components?.headers?.RequestId).toMatchObject({ schema: { type: 'string', format: 'uuid' } })
+    expect(doc.paths?.['/api/objects']?.get?.responses?.['200']?.headers?.['Request-Id']).toEqual({
+      $ref: '#/components/headers/RequestId',
+    })
   })
 
   it('advertises and serves the Arazzo workflow description', async () => {
@@ -159,7 +240,7 @@ describe('global OpenAPI document', () => {
     expect(await headResponse.text()).toBe('')
   })
 
-  it('publishes the external OAuth scope catalog with delegated CLI authentication', async () => {
+  it('publishes the external OAuth scope catalog without client-owned credential configuration', async () => {
     const { app } = await createTestApp({ DOWNLOAD_TOKEN_SECRET: 'test-download-token-secret' })
     const res = await app.request('/api/openapi.json')
     const doc = (await res.json()) as {
@@ -169,26 +250,19 @@ describe('global OpenAPI document', () => {
           { type?: string; scheme?: string; flows?: { authorizationCode?: { scopes?: Record<string, string> } } }
         >
       }
-      'x-cli-config'?: {
-        profiles?: {
-          default?: {
-            credentials?: Record<
-              string,
-              { auth?: { params?: Record<string, unknown> }; params?: Record<string, unknown> }
-            >
-          }
-        }
-      }
+      'x-cli-config'?: unknown
     }
 
     expect(doc.components?.securitySchemes?.oauth2).toMatchObject({
       type: 'oauth2',
+      'x-dpop-required': true,
       flows: {
         authorizationCode: {
           authorizationUrl: '/api/auth/oauth2/authorize',
           tokenUrl: '/api/auth/oauth2/token',
           refreshUrl: '/api/auth/oauth2/token',
           scopes: expect.objectContaining({
+            [AuthorizationScope.WORKSPACES_DISCOVER]: 'Discover workspaces available to the connected account',
             [AuthorizationScope.OBJECTS_READ]: 'List, inspect, and download objects',
             [AuthorizationScope.OBJECTS_CREATE]: 'Create folders and upload objects',
             [AuthorizationScope.SHARES_CREATE]: 'Create public shares',
@@ -198,22 +272,7 @@ describe('global OpenAPI document', () => {
       },
     })
     expect(doc.components?.securitySchemes?.agentApiKey).toBeUndefined()
-    expect(doc['x-cli-config']?.profiles?.default?.credentials?.oauth2).toEqual({
-      auth: {
-        type: 'api-key',
-        params: {
-          in: 'header',
-          name: 'Authorization',
-          value: 'DPoP',
-          provider: 'realmroot-target',
-          scopes: expect.stringContaining(AuthorizationScope.OBJECTS_CREATE),
-        },
-      },
-      params: { provider: 'realmroot-target' },
-    })
-    expect(doc['x-cli-config']?.profiles?.default?.credentials?.oauth2.auth?.params?.scopes).not.toContain(
-      AuthorizationScope.OBJECTS_PURGE,
-    )
+    expect(doc['x-cli-config']).toBeUndefined()
   })
 
   it('publishes scopes through authorization-server metadata without a duplicate catalog endpoint', async () => {
@@ -263,23 +322,36 @@ describe('global OpenAPI document', () => {
     expect(await protectedResource.json()).toMatchObject({
       resource: 'http://localhost/api',
       authorization_servers: ['http://localhost:3000/api/auth'],
+      bearer_methods_supported: [],
       scopes_supported: expect.arrayContaining([AuthorizationScope.OBJECTS_READ]),
+      dpop_bound_access_tokens_required: true,
     })
 
     const protectedHead = await app.request('/.well-known/oauth-protected-resource/api', { method: 'HEAD' })
     expect(protectedHead.status).toBe(200)
   })
 
-  it('serves HEAD for OAuth discovery and OpenID metadata endpoints', async () => {
+  it('serves RFC discovery paths for OAuth and OpenID metadata', async () => {
     const { app } = await createTestApp({ DOWNLOAD_TOKEN_SECRET: 'test-download-token-secret' })
-    const [authServer, openidConfig] = await Promise.all([
+    const [authServer, openidConfig, openidHead] = await Promise.all([
       app.request('/.well-known/oauth-authorization-server/api/auth', { method: 'HEAD' }),
+      app.request('/.well-known/openid-configuration/api/auth'),
       app.request('/.well-known/openid-configuration/api/auth', { method: 'HEAD' }),
     ])
 
     expect(authServer.status).toBe(200)
-    expect(openidConfig.status).toBe(404)
+    expect(openidConfig.status).toBe(200)
+    expect(await openidConfig.json()).toMatchObject({
+      issuer: 'http://localhost:3000/api/auth',
+      authorization_endpoint: 'http://localhost:3000/api/auth/oauth2/authorize',
+      token_endpoint: 'http://localhost:3000/api/auth/oauth2/token',
+      authorization_details_catalog_endpoint: 'http://localhost:3000/api/auth/oauth2/authorization-details/catalog',
+      authorization_details_catalog_scope: AuthorizationScope.WORKSPACES_DISCOVER,
+      authorization_details_catalog_version: 1,
+    })
+    expect(openidHead.status).toBe(200)
     expect(await authServer.text()).toBe('')
+    expect(await openidHead.text()).toBe('')
   })
 
   it('documents the workspace-scoped API-key event-stream authorization contract', async () => {
@@ -471,7 +543,7 @@ describe('global OpenAPI document', () => {
     })
   })
 
-  it('keeps purge scope separate from its non-OAuth credential policy', async () => {
+  it('authorizes permanent purge with its OAuth scope independently from the credential type', async () => {
     const { app } = await createTestApp({ DOWNLOAD_TOKEN_SECRET: 'test-download-token-secret' })
     const res = await app.request('/api/openapi.json')
     const doc = (await res.json()) as {
@@ -479,10 +551,13 @@ describe('global OpenAPI document', () => {
     }
 
     const operation = doc.paths['/api/trash/objects/{id}']?.delete
-    expect(operation?.security).toEqual([{ bearerAuth: [] }, { cookieAuth: [] }])
+    expect(operation?.security).toEqual([
+      { oauth2: [AuthorizationScope.OBJECTS_PURGE] },
+      { bearerAuth: [] },
+      { cookieAuth: [] },
+    ])
     expect(operation?.['x-zpan-authorization-constraints']).toEqual({
       requiredScopes: [AuthorizationScope.OBJECTS_PURGE],
-      oauth: false,
       minTeamRole: 'editor',
     })
   })
@@ -563,7 +638,12 @@ describe('global OpenAPI document', () => {
         name: expect.any(Object),
         type: expect.any(Object),
         size: expect.any(Object),
-        parent: expect.any(Object),
+        parent: {
+          description:
+            'Slash-delimited parent folder path relative to the workspace root; use an empty string for the root.',
+          default: '',
+          type: 'string',
+        },
         onConflict: expect.any(Object),
         storageId: {
           description:
@@ -753,27 +833,53 @@ describe('global OpenAPI document', () => {
     })
   })
 
-  it("merges better-auth's auto-generated schema (incl. the device flow) into the same doc", async () => {
+  it('publishes only the registered Better Auth Downloader Device Flow operations', async () => {
     const { app } = await createTestApp({ DOWNLOAD_TOKEN_SECRET: 'test-download-token-secret' })
     const res = await app.request('/api/openapi.json')
     const doc = (await res.json()) as {
       paths: Record<
         string,
         {
+          get?: Record<string, unknown>
           post?: {
+            operationId?: string
+            tags?: string[]
+            security?: Record<string, string[]>[]
             responses?: Record<
               string,
-              { content?: { 'application/json'?: { schema?: { properties?: Record<string, unknown> } } } }
+              {
+                content?: {
+                  'application/json'?: {
+                    schema?: { properties?: Record<string, unknown>; required?: string[] }
+                  }
+                }
+              }
             >
           }
         }
       >
+      components?: {
+        headers?: Record<string, unknown>
+        schemas?: Record<string, unknown>
+      }
     }
-    // better-auth's device-authorization endpoints come from its openAPI plugin,
-    // not hand-written stubs — prefixed under /api/auth.
-    const authPaths = Object.keys(doc.paths).filter((p) => p.startsWith('/api/auth/'))
-    expect(authPaths.length).toBeGreaterThan(0)
-    expect(authPaths.some((p) => p.includes('/device/'))).toBe(true)
+
+    expect(Object.keys(doc.paths).filter((path) => path.startsWith('/api/auth/device/'))).toEqual([
+      '/api/auth/device/code',
+      '/api/auth/device/token',
+    ])
+    expect(Object.keys(doc.paths['/api/auth/device/code'] ?? {})).toEqual(['post'])
+    expect(Object.keys(doc.paths['/api/auth/device/token'] ?? {})).toEqual(['post'])
+    expect(doc.paths['/api/auth/device/code']?.post).toMatchObject({
+      operationId: 'createDeviceAuthorization',
+      tags: ['Downloader Device Flow'],
+      security: [],
+    })
+    expect(doc.paths['/api/auth/device/token']?.post).toMatchObject({
+      operationId: 'createDeviceAccessToken',
+      tags: ['Downloader Device Flow'],
+      security: [],
+    })
     expect(
       doc.paths['/api/auth/device/token']?.post?.responses?.['200']?.content?.['application/json']?.schema?.properties,
     ).toMatchObject({
@@ -782,5 +888,75 @@ describe('global OpenAPI document', () => {
       expires_in: { type: 'integer' },
       scope: { type: 'string' },
     })
+    expect(
+      doc.paths['/api/auth/device/token']?.post?.responses?.['200']?.content?.['application/json']?.schema?.required,
+    ).toEqual(['access_token', 'token_type', 'expires_in'])
+
+    expect(doc.paths['/api/auth/sign-in/email']).toBeUndefined()
+    expect(doc.paths['/api/auth/organization/create']).toBeUndefined()
+    expect(doc.paths['/api/auth/admin/list-users']).toBeUndefined()
+    expect(doc.paths['/api/auth/api-key/create']).toBeUndefined()
+    expect(doc.components?.schemas?.Session).toBeUndefined()
+    expect(doc.components?.schemas?.User).toBeUndefined()
+    // The registered Better Auth operations need no imported components after
+    // their declared normalization. ZPan's later framework-level response
+    // decoration adds only the shared RequestId header reference.
+    const requestIdReference = '#/components/headers/RequestId'
+    for (const path of ['/api/auth/device/code', '/api/auth/device/token']) {
+      const references = collectOpenApiReferences(doc.paths[path])
+      expect(references.length).toBeGreaterThan(0)
+      expect([...new Set(references)]).toEqual([requestIdReference])
+      for (const reference of references) {
+        expect(resolveLocalOpenApiReference(doc, reference)).toBe(doc.components?.headers?.RequestId)
+      }
+    }
+    const operationIds = Object.values(doc.paths).flatMap((path) =>
+      Object.values(path).flatMap((operation) =>
+        operation && typeof operation === 'object' && 'operationId' in operation ? [operation.operationId] : [],
+      ),
+    )
+    expect(operationIds.filter((id) => id === 'createDeviceAuthorization')).toHaveLength(1)
+    expect(operationIds.filter((id) => id === 'createDeviceAccessToken')).toHaveLength(1)
+  })
+
+  it('keeps Better Auth runtime login, reference, and schema routes mounted', async () => {
+    const { app } = await createTestApp({ DOWNLOAD_TOKEN_SECRET: 'test-download-token-secret' })
+    const [login, reference, schema] = await Promise.all([
+      app.request('/api/auth/sign-in/email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'missing@example.com', password: 'wrong-password' }),
+      }),
+      app.request('/api/auth/reference'),
+      app.request('/api/auth/open-api/generate-schema'),
+    ])
+
+    expect(login.status).not.toBe(404)
+    expect(reference.status).toBe(200)
+    expect(reference.headers.get('content-type')).toContain('text/html')
+    expect(schema.status).toBe(200)
+    await expect(schema.json()).resolves.toMatchObject({ paths: expect.any(Object) })
   })
 })
+
+function collectOpenApiReferences(value: unknown): string[] {
+  if (Array.isArray(value)) return value.flatMap(collectOpenApiReferences)
+  if (!value || typeof value !== 'object') return []
+  const object = value as Record<string, unknown>
+  return [
+    ...(typeof object.$ref === 'string' ? [object.$ref] : []),
+    ...Object.values(object).flatMap(collectOpenApiReferences),
+  ]
+}
+
+function resolveLocalOpenApiReference(document: unknown, reference: string): unknown {
+  if (!reference.startsWith('#/')) return undefined
+  return reference
+    .slice(2)
+    .split('/')
+    .map((segment) => segment.replaceAll('~1', '/').replaceAll('~0', '~'))
+    .reduce<unknown>((value, segment) => {
+      if (!value || typeof value !== 'object') return undefined
+      return (value as Record<string, unknown>)[segment]
+    }, document)
+}

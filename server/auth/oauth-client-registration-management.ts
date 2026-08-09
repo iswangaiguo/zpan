@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { generateToken } from '../../shared/ids'
 import {
   JWT_BEARER_GRANT_TYPE,
   OAUTH_SCOPES,
@@ -62,6 +63,42 @@ const KNOWN_METADATA_FIELDS = new Set([
   'resources',
   'require_pkce',
 ])
+const oauthClientMetadataOpenApiProperties = {
+  redirect_uris: { type: 'array', items: { type: 'string', format: 'uri' } },
+  token_endpoint_auth_method: { type: 'string' },
+  grant_types: { type: 'array', items: { type: 'string' } },
+  response_types: { type: 'array', items: { type: 'string' } },
+  client_name: { type: 'string' },
+  client_uri: { type: 'string', format: 'uri' },
+  logo_uri: { type: 'string', format: 'uri' },
+  scope: { type: 'string' },
+  contacts: { type: 'array', items: { type: 'string' } },
+  tos_uri: { type: 'string', format: 'uri' },
+  policy_uri: { type: 'string', format: 'uri' },
+  jwks_uri: { type: 'string', format: 'uri' },
+  jwks: {
+    oneOf: [
+      { type: 'array', items: { type: 'object', additionalProperties: true } },
+      {
+        type: 'object',
+        additionalProperties: true,
+        properties: { keys: { type: 'array', items: { type: 'object', additionalProperties: true } } },
+      },
+    ],
+  },
+  software_id: { type: 'string' },
+  software_version: { type: 'string' },
+  software_statement: { type: 'string' },
+  post_logout_redirect_uris: { type: 'array', items: { type: 'string', format: 'uri' } },
+  backchannel_logout_uri: { type: 'string', format: 'uri' },
+  backchannel_logout_session_required: { type: 'boolean' },
+  type: { type: 'string', enum: ['web', 'native', 'user-agent-based'] },
+  subject_type: { type: 'string', enum: ['public', 'pairwise'] },
+  dpop_bound_access_tokens: { type: 'boolean' },
+  authorization_details_types: { type: 'array', items: { type: 'string' } },
+  resources: { type: 'array', items: { type: 'string', format: 'uri' } },
+  require_pkce: { type: 'boolean' },
+} as const
 
 const absoluteUrl = z.string().url()
 const updateSchema = z
@@ -102,37 +139,48 @@ const updateSchema = z
   .passthrough()
 
 export function addOAuthClientRegistrationManagementOpenApi(document: { paths: Record<string, unknown> }): void {
-  const registration = document.paths['/api/auth/oauth2/register'] as
-    | { post?: { responses?: Record<string, { content?: Record<string, { schema?: Record<string, unknown> }> }> } }
-    | undefined
-  const registrationSchema = registration?.post?.responses?.['201']?.content?.['application/json']?.schema
-  if (registrationSchema) {
-    const properties = (registrationSchema.properties ?? {}) as Record<string, unknown>
-    registrationSchema.properties = {
-      ...properties,
-      registration_client_uri: { type: 'string', format: 'uri' },
-      registration_access_token: { type: 'string' },
-    }
-    registrationSchema.required = [
-      ...new Set([
-        ...(Array.isArray(registrationSchema.required) ? registrationSchema.required : []),
-        'registration_client_uri',
-        'registration_access_token',
-      ]),
-    ]
-  }
-
   const clientInformationSchema = {
     type: 'object',
     additionalProperties: true,
     properties: {
+      ...oauthClientMetadataOpenApiProperties,
       client_id: { type: 'string' },
+      client_secret: { type: 'string' },
+      client_id_issued_at: { type: 'integer' },
+      client_secret_expires_at: { type: 'integer' },
       registration_client_uri: { type: 'string', format: 'uri' },
       registration_access_token: { type: 'string' },
-      scope: { type: 'string' },
     },
     required: ['client_id', 'registration_client_uri', 'registration_access_token'],
   }
+  document.paths['/api/auth/oauth2/register'] = {
+    post: {
+      operationId: 'createDynamicOAuthClientRegistration',
+      tags: ['OAuth'],
+      summary: 'Create a dynamic OAuth client registration',
+      security: [],
+      requestBody: {
+        required: true,
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              additionalProperties: true,
+              properties: oauthClientMetadataOpenApiProperties,
+            },
+          },
+        },
+      },
+      responses: {
+        '201': {
+          description: 'OAuth client registration created',
+          content: { 'application/json': { schema: clientInformationSchema } },
+        },
+        '400': { description: 'Invalid client metadata' },
+      },
+    },
+  }
+
   const bearerSecurity = [{ bearerAuth: [] }]
   document.paths['/api/auth/oauth2/register/{clientId}'] = {
     parameters: [{ name: 'clientId', in: 'path', required: true, schema: { type: 'string' } }],
@@ -281,7 +329,7 @@ async function updateClient(
   if (metadata.token_endpoint_auth_method !== current.tokenEndpointAuthMethod) {
     return invalidClientMetadata('token_endpoint_auth_method cannot be changed without rotating client credentials')
   }
-  const validationError = validateMetadata(metadata)
+  const validationError = validateMetadata(metadata, url)
   if (validationError) return invalidClientMetadata(validationError)
   for (const resourceId of metadata.resources ?? []) {
     if (!(await isOAuthResourceAvailable(db, resourceId))) {
@@ -334,7 +382,7 @@ async function updateClient(
   return oauthJson(200, await clientInformation(db, updated, url, registrationToken))
 }
 
-function validateMetadata(metadata: z.infer<typeof updateSchema>): string | null {
+function validateMetadata(metadata: z.infer<typeof updateSchema>, serverUrl: URL): string | null {
   if (metadata.grant_types.some((grant) => !SUPPORTED_GRANTS.has(grant)))
     return 'grant_types contains an unsupported grant type'
   if (metadata.grant_types.includes('authorization_code')) {
@@ -351,8 +399,23 @@ function validateMetadata(metadata: z.infer<typeof updateSchema>): string | null
     return 'authorization_details_types contains an unsupported type'
   }
   if (metadata.jwks && metadata.jwks_uri) return 'jwks and jwks_uri are mutually exclusive'
-  if (metadata.jwks_uri && new URL(metadata.jwks_uri).protocol !== 'https:') return 'jwks_uri must use HTTPS'
+  if (metadata.jwks_uri && !isSecureOrLocalDevelopmentUrl(metadata.jwks_uri, serverUrl)) {
+    return 'jwks_uri must use HTTPS'
+  }
   return null
+}
+
+function isSecureOrLocalDevelopmentUrl(value: string, serverUrl: URL): boolean {
+  const url = new URL(value)
+  if (url.protocol === 'https:') return true
+  if (url.protocol !== 'http:') return false
+  return isLoopbackHostname(serverUrl.hostname) && isLoopbackHostname(url.hostname)
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  return (
+    hostname === 'localhost' || hostname.endsWith('.localhost') || hostname === '[::1]' || hostname.startsWith('127.')
+  )
 }
 
 async function clientInformation(
@@ -426,8 +489,7 @@ function mergedHeaders(...inputs: Array<HeadersInit | undefined>): Headers {
 }
 
 function registrationToken(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(32))
-  return `zpr_${base64Url(bytes)}`
+  return generateToken(43)
 }
 
 function configurationUrl(clientId: string, baseUrl: string): URL {

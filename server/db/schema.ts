@@ -18,6 +18,9 @@ export const matters = sqliteTable(
     status: text('status').notNull().default('draft'), // draft, active
     trashedAt: integer('trashed_at'), // null = live, epoch ms = in trash (soft delete)
     purgedAt: integer('purged_at'), // null = retained/billable, epoch ms = content permanently removed
+    createdByActorType: text('created_by_actor_type'),
+    createdByActorRef: text('created_by_actor_ref'),
+    createdByActorIssuer: text('created_by_actor_issuer'),
     createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
     updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
   },
@@ -68,7 +71,7 @@ export const webdavLocks = sqliteTable(
   'webdav_locks',
   {
     id: text('id').primaryKey(),
-    token: text('token').notNull().unique(),
+    token: text('token').notNull().unique(), // WebDAV opaquelocktoken URI value
     orgId: text('org_id').notNull(),
     resourcePath: text('resource_path').notNull(),
     owner: text('owner').notNull().default(''),
@@ -412,6 +415,9 @@ export const downloadTasks = sqliteTable(
     id: text('id').primaryKey(),
     orgId: text('org_id').notNull(),
     createdByUserId: text('created_by_user_id').notNull(),
+    requestedByActorType: text('requested_by_actor_type'),
+    requestedByActorRef: text('requested_by_actor_ref'),
+    requestedByActorIssuer: text('requested_by_actor_issuer'),
     sourceType: text('source_type').notNull(),
     sourceUri: text('source_uri').notNull(),
     displayName: text('display_name'),
@@ -529,6 +535,7 @@ export const auditEvents = sqliteTable(
   'audit_events',
   {
     id: text('id').primaryKey(),
+    eventKey: text('event_key').unique(),
     orgId: text('org_id').notNull(),
     userId: text('user_id'),
     action: text('action').notNull(), // 'upload', 'create', 'delete', 'rename', 'move', 'restore'
@@ -682,11 +689,11 @@ export const imageHostingConfigs = sqliteTable('image_hosting_configs', {
 export const imageHostings = sqliteTable(
   'image_hostings',
   {
-    id: text('id').primaryKey(), // nanoid(12)
+    id: text('id').primaryKey(), // 13-character Base62 ID
     orgId: text('org_id')
       .notNull()
       .references(() => organization.id, { onDelete: 'cascade' }),
-    token: text('token').notNull().unique(), // "ih" + 10 alphanumeric characters
+    token: text('token').notNull().unique(), // i + 11 random Base62 characters
     path: text('path').notNull(), // virtual path e.g. "blog/2026/04/shot.png"
     storageId: text('storage_id')
       .notNull()

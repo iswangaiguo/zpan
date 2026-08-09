@@ -15,6 +15,7 @@ import { adminStats } from './http/admin-stats'
 import { ARAZZO_DOCUMENT_PATH, ARAZZO_MEDIA_TYPE, createArazzoDocument } from './http/arazzo'
 import { serveAvatarBlob } from './http/avatar-blobs'
 import backgroundJobs from './http/background-jobs'
+import { addRegisteredBetterAuthOpenApiOperations, DOWNLOADER_DEVICE_FLOW_TAG } from './http/better-auth-openapi'
 import { configz } from './http/configz'
 import downloadTasks, { downloaderTasksRoute } from './http/downloads/download-tasks'
 import downloaders, { downloaderSelfRoute } from './http/downloads/downloaders'
@@ -26,6 +27,7 @@ import { notifications } from './http/notifications'
 import { oauthAuthorizationDetails } from './http/oauth-authorization-details'
 import { oauthGrants } from './http/oauth-grants'
 import objects from './http/objects'
+import { addRequestIdOpenApi } from './http/openapi'
 import { adminQuotas, userQuotas } from './http/quotas'
 import redirect from './http/redirect'
 import { authedShares, publicShares } from './http/shares'
@@ -131,6 +133,7 @@ export function createApp(platform: Platform, auth: Auth, deps: Deps = createDep
     cors({
       origin: (origin) => (origin && corsOrigins.has(origin) ? origin : null),
       allowHeaders: ['Content-Type', 'Authorization'],
+      exposeHeaders: ['Request-Id'],
       allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
       credentials: true,
     }),
@@ -165,15 +168,28 @@ export function createApp(platform: Platform, auth: Auth, deps: Deps = createDep
     const response = await c.get('auth').handler(c.req.raw)
     if (c.req.method === 'HEAD' || !response.ok) return response
     const metadata = (await response.json()) as Record<string, unknown>
+    const authOrigin = new URL((await c.get('auth').$context).baseURL).origin
     return c.json({
       ...metadata,
-      authorization_details_catalog_endpoint: `${new URL(c.req.url).origin}/api/auth/oauth2/authorization-details/catalog`,
+      authorization_details_catalog_endpoint: `${authOrigin}/api/auth/oauth2/authorization-details/catalog`,
       authorization_details_catalog_scope: AuthorizationScope.WORKSPACES_DISCOVER,
+      authorization_details_catalog_version: 1,
     })
   })
 
   app.on(['GET', 'HEAD'], '/.well-known/openid-configuration/api/auth', async (c) => {
-    return c.get('auth').handler(c.req.raw)
+    const url = new URL(c.req.url)
+    url.pathname = '/api/auth/.well-known/openid-configuration'
+    const response = await c.get('auth').handler(new Request(url, c.req.raw))
+    if (c.req.method === 'HEAD' || !response.ok) return response
+    const metadata = (await response.json()) as Record<string, unknown>
+    const authOrigin = new URL((await c.get('auth').$context).baseURL).origin
+    return c.json({
+      ...metadata,
+      authorization_details_catalog_endpoint: `${authOrigin}/api/auth/oauth2/authorization-details/catalog`,
+      authorization_details_catalog_scope: AuthorizationScope.WORKSPACES_DISCOVER,
+      authorization_details_catalog_version: 1,
+    })
   })
 
   app.on(['GET', 'HEAD'], '/.well-known/oauth-protected-resource/api', async (c) => {
@@ -182,9 +198,10 @@ export function createApp(platform: Platform, auth: Auth, deps: Deps = createDep
     return c.json({
       resource: `${origin}/api`,
       authorization_servers: [authorizationServer],
-      bearer_methods_supported: ['header'],
+      bearer_methods_supported: [],
       scopes_supported: OAUTH_RESOURCE_SCOPES,
       dpop_signing_alg_values_supported: ['ES256', 'EdDSA'],
+      dpop_bound_access_tokens_required: true,
       resource_name: 'ZPan API',
     })
   })
@@ -209,10 +226,10 @@ export function createApp(platform: Platform, auth: Auth, deps: Deps = createDep
     return c.newResponse(JSON.stringify(createArazzoDocument(new URL(c.req.url).origin)), 200, headers)
   })
 
-  // Global OpenAPI document. Aggregates every route defined with `.openapi()`
-  // across all mounted sub-apps — a route appears here as soon as its resource is
-  // converted to OpenAPIHono, no curation needed. better-auth endpoints (incl. the
-  // device flow) document themselves separately at /api/auth/reference.
+  // Global OpenAPI document. ZPan routes defined with `.openapi()` are
+  // aggregated across all mounted sub-apps. Better Auth documents its complete
+  // runtime surface separately at /api/auth/reference; only the Downloader
+  // Device Flow protocol is explicitly admitted to this product contract.
   app.get('/api/openapi.json', async (c) => {
     const doc = app.getOpenAPIDocument({
       openapi: '3.1.0',
@@ -228,41 +245,13 @@ export function createApp(platform: Platform, auth: Auth, deps: Deps = createDep
         { name: 'Events', description: 'Multiplexed server-sent event stream' },
         { name: 'Download Tasks', description: 'Remote download tasks' },
         { name: 'Downloaders', description: 'Download agents and their heartbeats' },
+        {
+          name: DOWNLOADER_DEVICE_FLOW_TAG,
+          description: 'Public device authorization protocol used by downloader clients',
+        },
       ],
     })
 
-    // Merge better-auth's own auto-generated schema (sign-in/up, organization,
-    // the device-authorization flow, …) into the same document. Both halves are
-    // generated — nothing here is a hand-maintained endpoint definition; new
-    // better-auth endpoints appear automatically. Its paths are relative to the
-    // /api/auth mount, so prefix them.
-    const authDoc = (await c.get('auth').api.generateOpenAPISchema()) as {
-      paths?: Record<string, unknown>
-      components?: { schemas?: Record<string, unknown> }
-    }
-    for (const [path, item] of Object.entries(authDoc.paths ?? {})) {
-      doc.paths[`/api/auth${path}`] = item as (typeof doc.paths)[string]
-    }
-    // better-auth 1.7.0-rc.2 documents POST /device/token with its session
-    // response even though the handler returns an OAuth device token. Keep the
-    // generated contract aligned with the wire response until upstream fixes it.
-    const deviceTokenJson = (
-      doc.paths['/api/auth/device/token'] as
-        | { post?: { responses?: Record<string, { content?: Record<string, { schema?: unknown }> }> } }
-        | undefined
-    )?.post?.responses?.['200']?.content?.['application/json']
-    if (deviceTokenJson) {
-      deviceTokenJson.schema = {
-        type: 'object',
-        properties: {
-          access_token: { type: 'string' },
-          token_type: { type: 'string' },
-          expires_in: { type: 'integer' },
-          scope: { type: 'string' },
-        },
-        required: ['access_token', 'token_type', 'expires_in'],
-      }
-    }
     doc.components ??= {}
     doc.components.securitySchemes = {
       ...(doc.components.securitySchemes ?? {}),
@@ -270,6 +259,7 @@ export function createApp(platform: Platform, auth: Auth, deps: Deps = createDep
       bearerAuth: { type: 'http', scheme: 'bearer' },
       oauth2: {
         type: 'oauth2',
+        'x-dpop-required': true,
         flows: {
           authorizationCode: {
             authorizationUrl: '/api/auth/oauth2/authorize',
@@ -283,37 +273,21 @@ export function createApp(platform: Platform, auth: Auth, deps: Deps = createDep
       },
     }
     addOAuthClientRegistrationManagementOpenApi(doc)
-    doc.components.schemas = {
-      ...(authDoc.components?.schemas as typeof doc.components.schemas),
-      ...doc.components.schemas,
-    }
+
+    // Better Auth owns the runtime routes and its complete reference schema.
+    // The product contract imports only operations whose path, method, public
+    // identity, tags, security, and any narrow correction are registered
+    // explicitly. Reachable components are copied transitively; everything
+    // else remains private by default.
+    const authDoc = await c.get('auth').api.generateOpenAPISchema()
+    addRegisteredBetterAuthOpenApiOperations(doc, authDoc)
     Object.assign(doc, {
       'x-zpan-discovery': {
         oauthAuthorizationServer: '/.well-known/oauth-authorization-server/api/auth',
         oauthProtectedResource: '/.well-known/oauth-protected-resource/api',
       },
-      'x-cli-config': {
-        profiles: {
-          default: {
-            credentials: {
-              oauth2: {
-                auth: {
-                  type: 'api-key',
-                  params: {
-                    in: 'header',
-                    name: 'Authorization',
-                    value: 'DPoP',
-                    provider: 'realmroot-target',
-                    scopes: OAUTH_RESOURCE_SCOPES.join(' '),
-                  },
-                },
-                params: { provider: 'realmroot-target' },
-              },
-            },
-          },
-        },
-      },
     })
+    addRequestIdOpenApi(doc)
 
     return c.json(doc)
   })
@@ -479,7 +453,10 @@ function getCorsOrigins(platform: Platform): Set<string> {
 }
 
 function agentScopeDescriptions(): Record<string, string> {
-  return { ...OAUTH_SCOPE_DESCRIPTIONS }
+  return {
+    ...OAUTH_SCOPE_DESCRIPTIONS,
+    [AuthorizationScope.WORKSPACES_DISCOVER]: 'Discover workspaces available to the connected account',
+  }
 }
 
 export type AppType = ReturnType<typeof createApp>

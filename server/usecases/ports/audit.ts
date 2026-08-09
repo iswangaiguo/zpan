@@ -1,14 +1,8 @@
 // Plain, framework-free DTOs and the repository port for audit events.
 
-export type AuditActorType =
-  | 'user'
-  | 'api_key'
-  | 'oauth'
-  | 'agent'
-  | 'anonymous'
-  | 'system'
-  | 'downloader'
-  | 'task-upload'
+import type { ActorAttribution, ActorType } from '@shared/schemas'
+
+export type AuditActorType = ActorType
 
 export interface RecordAuditEventInput {
   orgId: string
@@ -40,6 +34,7 @@ export interface AuditEvent {
 
 export interface AuditEventWithUser extends AuditEvent {
   user: { id: string | null; name: string; image: string | null }
+  actor: AuditActorProfile
 }
 
 export interface AdminAuditEventWithOrg extends AuditEventWithUser {
@@ -79,3 +74,43 @@ export interface AuditRepo {
     opts: ListAuditByTargetOpts,
   ): Promise<{ items: AuditEvent[]; total: number; page: number; pageSize: number }>
 }
+
+export interface ActorIdentity {
+  type: ActorType
+  ref: string | null
+  issuer: string | null
+}
+
+export interface ActorProfile {
+  name: string
+  image: string | null
+  profileUrl?: string | null
+  resolved: boolean
+}
+
+export interface ActorDirectory {
+  findUserProfiles(userIds: readonly string[]): Promise<ReadonlyMap<string, ActorProfile>>
+  findApiKeyNames(keyIds: readonly string[]): Promise<ReadonlyMap<string, string>>
+  findDeviceNames(deviceIds: readonly string[]): Promise<ReadonlyMap<string, string>>
+  listTrustedAgentIssuerOrigins(): Promise<ReadonlySet<string>>
+}
+
+export interface AgentInfoGateway {
+  // Profiles are display-only and never authoritative. An omitted identity
+  // tells the caller to retain the stable issuer/subject fallback.
+  resolve(
+    actors: readonly ActorIdentity[],
+    trustedIssuerOrigins: ReadonlySet<string>,
+  ): Promise<ReadonlyMap<string, ActorProfile>>
+}
+
+export type AuditActorIdentity = ActorIdentity
+export type AuditActorProfile = ActorProfile
+export type AuditActorDirectory = ActorDirectory
+export type { ActorAttribution }
+
+export function actorIdentityKey(actor: ActorIdentity): string {
+  return JSON.stringify([actor.type, actor.issuer, actor.ref])
+}
+
+export const auditActorIdentityKey = actorIdentityKey

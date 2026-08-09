@@ -11,6 +11,11 @@ import * as schema from '../db/schema'
 import type { Platform } from '../platform/interface'
 import { resetSitePublicOriginCache } from '../usecases/site/public-origin'
 
+const testPasswordProvider = {
+  hash: async (password: string) => `test:${password}`,
+  verify: async ({ hash, password }: { hash: string; password: string }) => hash === `test:${password}`,
+}
+
 const AUTH_SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS user (
     id TEXT PRIMARY KEY,
@@ -313,6 +318,9 @@ const APP_SCHEMA_SQL = `
     status TEXT NOT NULL DEFAULT 'draft',
     trashed_at INTEGER,
     purged_at INTEGER,
+    created_by_actor_type TEXT,
+    created_by_actor_ref TEXT,
+    created_by_actor_issuer TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   );
@@ -500,6 +508,7 @@ const APP_SCHEMA_SQL = `
   CREATE UNIQUE INDEX IF NOT EXISTS team_invite_links_token_unique ON team_invite_links(token);
 	  CREATE TABLE IF NOT EXISTS audit_events (
 		    id TEXT PRIMARY KEY,
+		    event_key TEXT UNIQUE,
 		    org_id TEXT NOT NULL,
 		    user_id TEXT,
 		    action TEXT NOT NULL,
@@ -692,6 +701,9 @@ const APP_SCHEMA_SQL = `
     id TEXT PRIMARY KEY,
     org_id TEXT NOT NULL,
     created_by_user_id TEXT NOT NULL,
+    requested_by_actor_type TEXT,
+    requested_by_actor_ref TEXT,
+    requested_by_actor_issuer TEXT,
     source_type TEXT NOT NULL,
     source_uri TEXT NOT NULL,
     display_name TEXT,
@@ -869,7 +881,17 @@ export async function createTestApp(
     getEnv: (key: string) => envOverrides[key] ?? (key === 'BETTER_AUTH_SECRET' ? 'test-secret' : undefined),
     getBinding: <T = unknown>(key: string) => bindingOverrides[key] as T | undefined,
   }
-  const auth = await createAuth(platform, 'test-secret', 'http://localhost:3000', undefined, backgroundTaskHandler)
+  // Auth integration tests exercise the HTTP/database contract. The production
+  // scrypt implementation has its own focused tests and would otherwise add a
+  // deliberately expensive hash to every signup performed by this shared fixture.
+  const auth = await createAuth(
+    platform,
+    'test-secret',
+    'http://localhost:3000',
+    undefined,
+    backgroundTaskHandler,
+    testPasswordProvider,
+  )
   const deps = createDeps(platform)
   const app = createApp(platform, auth, deps)
 

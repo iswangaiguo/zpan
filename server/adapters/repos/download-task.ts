@@ -1,5 +1,6 @@
 import { toDownloadTaskListItem } from '@shared/download-task'
-import { downloadTaskRuntimeSchema } from '@shared/schemas'
+import { generateId } from '@shared/ids'
+import { type ActorType, downloadTaskRuntimeSchema } from '@shared/schemas'
 import type { DownloadTask, DownloadTaskRuntime } from '@shared/types'
 import {
   and,
@@ -20,6 +21,7 @@ import {
 } from 'drizzle-orm'
 import { downloaders, downloadTasks } from '../../db/schema'
 import { executeWriteTransaction, executeWriteTransactionWithResults } from '../../db/transaction'
+import { fallbackActorAttribution } from '../../domain/actor-attribution'
 import { parseDownloadTaskEvents } from '../../domain/download-task-events'
 import type { Database } from '../../platform/interface'
 import {
@@ -87,7 +89,7 @@ function appendStatusEvent(
   },
 ): SQL {
   const appended = sql`json_insert(${events}, '$[#]', json_object(
-    'id', lower(hex(randomblob(16))),
+    'id', ${generateId()},
     'type', 'status_changed',
     'occurredAt', CAST(${input.now.getTime()} AS INTEGER),
     'attempt', CAST(${input.attempt} AS INTEGER),
@@ -122,7 +124,7 @@ function appendErrorEvent(
   },
 ): SQL {
   const appended = sql`json_insert(${events}, '$[#]', json_object(
-    'id', lower(hex(randomblob(16))),
+    'id', ${generateId()},
     'type', 'error_reported',
     'occurredAt', CAST(${input.now.getTime()} AS INTEGER),
     'attempt', CAST(${input.attempt} AS INTEGER),
@@ -143,7 +145,7 @@ function appendErrorEvent(
 
 function appendCleanupEvent(events: SQL, type: 'cleanup_requested' | 'cleanup_completed', now: Date): SQL {
   return sql`json_insert(${events}, '$[#]', json_object(
-    'id', lower(hex(randomblob(16))),
+    'id', ${generateId()},
     'type', ${type},
     'occurredAt', CAST(${now.getTime()} AS INTEGER),
     'attempt', CAST(${downloadTasks.attempt} AS INTEGER),
@@ -202,6 +204,9 @@ function toRecord(row: DownloadTaskRow): DownloadTaskRecord {
     id: row.id,
     orgId: row.orgId,
     createdByUserId: row.createdByUserId,
+    requestedByActorType: row.requestedByActorType as DownloadTaskRecord['requestedByActorType'],
+    requestedByActorRef: row.requestedByActorRef,
+    requestedByActorIssuer: row.requestedByActorIssuer,
     sourceType: row.sourceType,
     sourceUri: row.sourceUri,
     displayName: row.displayName,
@@ -238,10 +243,19 @@ function toRecord(row: DownloadTaskRow): DownloadTaskRecord {
 
 function toDownloadTask(row: DownloadTaskRow, control?: { action: 'delete'; requestedAt: string }): DownloadTask {
   const runtime = parseTaskRuntime(row.runtime)
+  const requestedBy =
+    row.requestedByActorType && row.requestedByActorRef
+      ? fallbackActorAttribution({
+          type: row.requestedByActorType as ActorType,
+          ref: row.requestedByActorRef,
+          issuer: row.requestedByActorIssuer,
+        })
+      : null
   return {
     id: row.id,
     orgId: row.orgId,
     createdBy: row.createdByUserId,
+    requestedBy,
     spec: {
       source: {
         type: row.sourceType as DownloadTask['spec']['source']['type'],
@@ -260,7 +274,11 @@ function toDownloadTask(row: DownloadTaskRow, control?: { action: 'delete'; requ
       state: row.status as DownloadTask['status']['state'],
       attempt: row.attempt,
       assignment: row.assignedDownloaderId
-        ? { downloaderId: row.assignedDownloaderId, assignedAt: row.assignedAt?.toISOString() ?? null }
+        ? {
+            downloaderId: row.assignedDownloaderId,
+            assignedAt: row.assignedAt?.toISOString() ?? null,
+            executor: fallbackActorAttribution({ type: 'device', ref: row.assignedDownloaderId, issuer: null }),
+          }
         : null,
       progress: runtime?.progress ?? emptyTaskProgress(),
       billing: {
@@ -360,6 +378,9 @@ export function createDownloadTaskRepo(db: Database): DownloadTaskRepo {
         id: input.id,
         orgId: input.orgId,
         createdByUserId: input.createdByUserId,
+        requestedByActorType: input.requestedByActorType ?? 'user',
+        requestedByActorRef: input.requestedByActorRef ?? input.createdByUserId,
+        requestedByActorIssuer: input.requestedByActorIssuer ?? null,
         sourceType: input.sourceType,
         sourceUri: input.sourceUri,
         displayName: input.displayName,

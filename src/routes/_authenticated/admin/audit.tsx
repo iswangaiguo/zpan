@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { createFileRoute } from '@tanstack/react-router'
 import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { ActorIdentity, auditEventActor } from '@/components/actor-identity'
 import { AdminPageHeader } from '@/components/admin/admin-page-header'
 import {
   AUDIT_DEFAULT_PAGE_SIZE,
@@ -15,7 +16,6 @@ import {
 } from '@/components/admin/audit-log-controls'
 import { ProBadge } from '@/components/ProBadge'
 import { UpgradeHint } from '@/components/UpgradeHint'
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Card } from '@/components/ui/card'
 import { useEntitlement } from '@/hooks/useEntitlement'
 import { type AdminAuditFilter, listAdminAuditLogs } from '@/lib/api'
@@ -37,15 +37,6 @@ function relativeTime(timestamp: string | Date): string {
   if (diffDay === 1) return 'yesterday'
   if (diffDay < 30) return `${diffDay}d ago`
   return date.toLocaleDateString()
-}
-
-function userInitials(name: string): string {
-  return name
-    .split(' ')
-    .map((n) => n[0])
-    .join('')
-    .toUpperCase()
-    .slice(0, 2)
 }
 
 function metaDetail(event: AdminAuditEvent, t: (key: string, opts?: Record<string, unknown>) => string): string {
@@ -70,19 +61,13 @@ function metaDetail(event: AdminAuditEvent, t: (key: string, opts?: Record<strin
 function AuditRow({ event }: { event: AdminAuditEvent }) {
   const { t } = useTranslation()
   const createdAt = new Date(event.createdAt as unknown as string | number)
-  const actorLabel = formatActor(event)
-  const actorImage = event.actorType === 'user' ? event.user.image : null
   return (
     <div className="flex items-start gap-3 py-3">
-      <Avatar className="h-8 w-8 flex-shrink-0">
-        {actorImage && <AvatarImage src={actorImage} alt={actorLabel} />}
-        <AvatarFallback className="text-xs">{userInitials(actorLabel)}</AvatarFallback>
-      </Avatar>
       <div className="min-w-0 flex-1">
-        <p className="text-sm">
-          <span className="font-medium">{actorLabel}</span>{' '}
+        <div className="flex flex-wrap items-center gap-2 text-sm">
+          <ActorIdentity actor={auditEventActor(event)} />
           <span className="text-muted-foreground">{metaDetail(event, t)}</span>
-        </p>
+        </div>
         <p className="text-xs text-muted-foreground">
           {event.orgName && <span className="mr-1">{event.orgName} ·</span>}
           {relativeTime(createdAt)}
@@ -90,22 +75,6 @@ function AuditRow({ event }: { event: AdminAuditEvent }) {
       </div>
     </div>
   )
-}
-
-function formatActor(event: AdminAuditEvent): string {
-  if (event.actorType === 'oauth') {
-    const identity = event.actorRef ?? 'unknown'
-    return event.actorIssuer ? `Agent:${identity} · ${event.actorIssuer}` : `Agent:${identity}`
-  }
-  if (event.user.name) return event.user.name
-  if (event.userId) return event.userId
-  if (event.actorType === 'api_key') return event.actorRef ? `API key:${event.actorRef}` : 'API key'
-  if (event.actorType === 'agent') return event.actorRef ? `Agent:${event.actorRef}` : 'Agent'
-  if (event.actorType === 'anonymous') return 'Anonymous'
-  if (event.actorType === 'system') return event.actorRef ? `System:${event.actorRef}` : 'System'
-  if (event.actorType === 'downloader') return event.actorRef ? `Downloader:${event.actorRef}` : 'Downloader'
-  if (event.actorType === 'task-upload') return event.actorRef ? `Task upload:${event.actorRef}` : 'Task upload'
-  return 'Unknown'
 }
 
 function AuditLogsPage() {

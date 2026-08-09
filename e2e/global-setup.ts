@@ -6,6 +6,7 @@
 import { expect, request as playwrightRequest, test as setup } from '@playwright/test'
 import Database from 'better-sqlite3'
 import { hashPassword } from '../server/lib/password'
+import { generateId } from '../shared/ids'
 import { ADMIN_EMAIL, ADMIN_PASSWORD } from './helpers'
 
 const localBaseUrl = process.env.E2E_LOCAL_BASE_URL ?? 'http://localhost:5185'
@@ -153,7 +154,7 @@ function ensureNodeStorage() {
       `,
     )
     .run(
-      crypto.randomUUID(),
+      generateId(),
       storageConfig.bucket,
       storageConfig.endpoint,
       storageConfig.region,
@@ -189,8 +190,7 @@ setup('seed admin and storage', async () => {
         data: { email: ADMIN_EMAIL, password: ADMIN_PASSWORD },
       })
       if (!authResp.ok()) {
-        console.warn('[setup] could not authenticate admin')
-        return
+        throw new Error(`could not authenticate E2E admin: ${authResp.status()} ${await authResp.text()}`)
       }
     }
 

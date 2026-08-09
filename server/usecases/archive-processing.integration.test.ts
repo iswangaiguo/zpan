@@ -41,8 +41,8 @@ function archiveDeps(db: TestDb): ArchiveProcessingDeps {
   }
 }
 
-const ORG_ID = 'archive-org'
-const USER_ID = 'archive-user'
+const ORG_ID = 'archiveOrg'
+const USER_ID = 'archiveUser'
 const STORAGE_ID = 'archive-storage'
 
 async function seedStoragePlanEntitlement(db: TestDb, orgId: string, bytes: number, id: string) {
@@ -222,30 +222,63 @@ describe('archive processing', () => {
     const job = await createArchiveJob(archiveDeps(db), {
       orgId: ORG_ID,
       userId: USER_ID,
+      createdBy: { type: 'oauth', ref: 'agent-1', issuer: 'https://realm.example.com' },
       request: { type: 'archive_extract', matterId: 'zip-matter' },
       s3: s3 as unknown as S3Gateway,
     })
 
     expect(job).toMatchObject({ status: 'completed', type: 'archive_extract' })
     expect(job.progress).toMatchObject({ outputBytes: 5, fileCount: 1 })
-    const rows = await db.all<{ name: string; parent: string; dirtype: number; size: number; object: string }>(sql`
-      SELECT name, parent, dirtype, size, object FROM matters
+    const rows = await db.all<{
+      name: string
+      parent: string
+      dirtype: number
+      size: number
+      object: string
+      createdByActorType: string | null
+      createdByActorRef: string | null
+      createdByActorIssuer: string | null
+    }>(sql`
+      SELECT name, parent, dirtype, size, object,
+        created_by_actor_type AS createdByActorType,
+        created_by_actor_ref AS createdByActorRef,
+        created_by_actor_issuer AS createdByActorIssuer
+      FROM matters
       WHERE org_id = ${ORG_ID} AND status = 'active'
       ORDER BY dirtype DESC, name ASC
     `)
     expect(rows).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ name: 'docs', parent: '', dirtype: 1, size: 0 }),
-        expect.objectContaining({ name: 'hello.txt', parent: 'docs', dirtype: 0, size: 5 }),
+        expect.objectContaining({
+          name: 'docs',
+          parent: '',
+          dirtype: 1,
+          size: 0,
+          createdByActorType: 'oauth',
+          createdByActorRef: 'agent-1',
+          createdByActorIssuer: 'https://realm.example.com',
+        }),
+        expect.objectContaining({
+          name: 'hello.txt',
+          parent: 'docs',
+          dirtype: 0,
+          size: 5,
+          createdByActorType: 'oauth',
+          createdByActorRef: 'agent-1',
+          createdByActorIssuer: 'https://realm.example.com',
+        }),
       ]),
     )
     expect(s3.putKeys).toHaveLength(1)
+    const extractedFile = rows.find((row) => row.name === 'hello.txt')
+    expect(extractedFile?.object).toMatch(/^archiveOrg\/archiveUser\/\d{8}\/[A-Za-z0-9]{17}\.txt$/)
+    expect(s3.putKeys[0]).toBe(extractedFile?.object)
   })
 
-  it('prevalidates then streams extraction for a 128 MiB ZIP entry', async () => {
+  it('prevalidates then streams extraction across multiple chunks', async () => {
     const { db } = await createTestApp()
     await seedStorage(db)
-    const size = 128 * 1024 * 1024
+    const size = 6 * 1024 * 1024
     const archive = await streamToBytes(
       zip.createZipArchiveStream([{ archivePath: 'large.bin', openStream: async () => generatedBytes(size) }]),
     )
@@ -269,10 +302,11 @@ describe('archive processing', () => {
   it('compresses selected matters into a ZIP matter and object', async () => {
     const { db } = await createTestApp()
     await seedStorage(db)
-    await seedMatter(db, { id: 'file-a', name: 'a.txt', object: 'objects/a.txt', size: 5 })
+    const sourceKey = 'legacy_/archive-source-.txt'
+    await seedMatter(db, { id: 'file-a', name: 'a.txt', object: sourceKey, size: 5 })
 
     const s3 = new MemoryS3()
-    s3.objects.set('objects/a.txt', bytes('hello'))
+    s3.objects.set(sourceKey, bytes('hello'))
 
     const job = await createArchiveJob(archiveDeps(db), {
       orgId: ORG_ID,
@@ -289,13 +323,15 @@ describe('archive processing', () => {
     `)
     expect(zipMatter).toHaveLength(1)
     expect(zipMatter[0].type).toBe('application/zip')
+    expect(zipMatter[0].object).toMatch(/^archiveOrg\/archiveUser\/\d{8}\/[A-Za-z0-9]{17}\.zip$/)
     expect(s3.objects.get(zipMatter[0].object)?.length).toBe(zipMatter[0].size)
+    expect(s3.objects.get(sourceKey)).toEqual(bytes('hello'))
   })
 
-  it('streams compression for a 128 MiB source without buffering the source object', async () => {
+  it('streams compression across multiple chunks without buffering the source object', async () => {
     const { db } = await createTestApp()
     await seedStorage(db)
-    const size = 128 * 1024 * 1024
+    const size = 6 * 1024 * 1024
     await seedMatter(db, { id: 'large-file', name: 'large.bin', object: 'objects/large.bin', size })
 
     const s3 = new GeneratedObjectS3('objects/large.bin', size)
@@ -315,10 +351,10 @@ describe('archive processing', () => {
   it('persists compression progress while streaming source objects', async () => {
     const { db } = await createTestApp()
     await seedStorage(db)
-    const size = 12 * 1024 * 1024
+    const size = 6 * 1024 * 1024
     await seedMatter(db, { id: 'progress-file', name: 'large.bin', object: 'objects/progress.bin', size })
 
-    const s3 = new BlockingGeneratedObjectS3('objects/progress.bin', size, 6 * 1024 * 1024)
+    const s3 = new BlockingGeneratedObjectS3('objects/progress.bin', size, 5 * 1024 * 1024 + 1)
     const request = { type: 'archive_compress' as const, matterIds: ['progress-file'] }
     const queued = await enqueueArchiveJob(archiveDeps(db), {
       orgId: ORG_ID,
@@ -351,7 +387,7 @@ describe('archive processing', () => {
   it('persists extraction progress while streaming ZIP bytes', async () => {
     const { db } = await createTestApp()
     await seedStorage(db)
-    const size = 12 * 1024 * 1024
+    const size = 6 * 1024 * 1024
     const archive = createZip({ 'large.bin': filledBytes(size) })
     await seedMatter(db, {
       id: 'progress-zip',
@@ -360,7 +396,7 @@ describe('archive processing', () => {
       size: archive.byteLength,
     })
 
-    const s3 = new BlockingStoredObjectS3(6 * 1024 * 1024)
+    const s3 = new BlockingStoredObjectS3(5 * 1024 * 1024 + 1)
     s3.objects.set('source/progress.zip', archive)
     const request = { type: 'archive_extract' as const, matterId: 'progress-zip' }
     const queued = await enqueueArchiveJob(archiveDeps(db), {

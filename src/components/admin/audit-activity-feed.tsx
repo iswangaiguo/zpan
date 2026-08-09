@@ -1,8 +1,7 @@
 import type { AdminAuditEvent } from '@shared/types'
 import { useTranslation } from 'react-i18next'
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
+import { ActorIdentity, auditEventActor } from '@/components/actor-identity'
 import { Badge } from '@/components/ui/badge'
-import { getInitials } from '@/lib/format'
 
 export function AdminAuditActivityFeed({
   events,
@@ -64,15 +63,10 @@ function AdminAuditActivityItem({ event }: { event: AdminAuditEvent }) {
     ? Object.entries(metadata).filter(([key, value]) => !['status', 'result', 'from', 'to'].includes(key) && value)
     : []
   const targetName = event.targetName || event.targetId || event.targetType
-  const actorLabel = formatActor(event)
-  const actorImage = event.actorType === 'user' ? event.user.image : null
 
   return (
     <div className="flex items-start gap-3 py-3">
-      <Avatar className="h-8 w-8 flex-shrink-0">
-        {actorImage && <AvatarImage src={actorImage} alt={actorLabel} />}
-        <AvatarFallback className="text-xs">{getInitials(actorLabel)}</AvatarFallback>
-      </Avatar>
+      <ActorIdentity actor={auditEventActor(event)} compact className="max-w-48 shrink-0" />
       <div className="min-w-0 flex-1 space-y-1">
         <div className="flex flex-wrap items-center gap-2">
           <Badge variant="secondary">{t(`activity.action.${event.action}`, { defaultValue: event.action })}</Badge>
@@ -108,22 +102,6 @@ function AdminAuditActivityItem({ event }: { event: AdminAuditEvent }) {
       </div>
     </div>
   )
-}
-
-function formatActor(event: AdminAuditEvent): string {
-  if (event.actorType === 'oauth') {
-    const identity = event.actorRef ?? 'unknown'
-    return event.actorIssuer ? `Agent:${identity} · ${event.actorIssuer}` : `Agent:${identity}`
-  }
-  if (event.user.name) return event.user.name
-  if (event.userId) return event.userId
-  if (event.actorType === 'api_key') return event.actorRef ? `API key:${event.actorRef}` : 'API key'
-  if (event.actorType === 'agent') return event.actorRef ? `Agent:${event.actorRef}` : 'Agent'
-  if (event.actorType === 'anonymous') return 'Anonymous'
-  if (event.actorType === 'system') return event.actorRef ? `System:${event.actorRef}` : 'System'
-  if (event.actorType === 'downloader') return event.actorRef ? `Downloader:${event.actorRef}` : 'Downloader'
-  if (event.actorType === 'task-upload') return event.actorRef ? `Task upload:${event.actorRef}` : 'Task upload'
-  return 'Unknown'
 }
 
 function parseActivityMetadata(metadata: string | null): Record<string, string> | null {

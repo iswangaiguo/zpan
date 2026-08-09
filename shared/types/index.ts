@@ -1,5 +1,6 @@
 import type { CommercePayment, CommerceProduct, ProductPrice } from 'zpan-cloud-sdk'
 import type { DirType, ObjectStatus, StorageStatus, StorageStatusReason } from '../constants'
+import type { ActorAttribution } from '../schemas/actors'
 import type {
   CloudOrder as ZPanCloudOrder,
   CloudOrderFulfillmentPayload as ZPanCloudOrderFulfillmentPayload,
@@ -20,6 +21,7 @@ export interface StorageObject {
   status: ObjectStatus
   // Soft-delete marker: null = live, epoch ms = in trash.
   trashedAt: number | null
+  createdBy?: ActorAttribution | null
   createdAt: string
   updatedAt: string
 }
@@ -622,15 +624,7 @@ export interface Announcement {
   updatedAt: string
 }
 
-export type AuditActorType =
-  | 'user'
-  | 'api_key'
-  | 'oauth'
-  | 'agent'
-  | 'anonymous'
-  | 'system'
-  | 'downloader'
-  | 'task-upload'
+export type AuditActorType = 'user' | 'api_key' | 'oauth' | 'agent' | 'anonymous' | 'system' | 'device' | 'task-upload'
 
 export interface AuditEvent {
   id: string
@@ -649,6 +643,11 @@ export interface AuditEvent {
     id: string | null
     name: string
     image: string | null
+  }
+  actor: {
+    name: string
+    image: string | null
+    resolved: boolean
   }
 }
 

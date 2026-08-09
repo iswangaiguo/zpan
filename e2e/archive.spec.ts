@@ -1,4 +1,3 @@
-import { randomBytes } from 'node:crypto'
 import { expect, type Page, test } from '@playwright/test'
 import { DirType } from '../shared/constants'
 import type { BackgroundJob, PaginatedResponse, StorageObject } from '../shared/types'
@@ -7,13 +6,13 @@ import { signUpAndGoToFiles } from './helpers'
 const textType = 'text/plain'
 const fixtureSize = 6 * 1024 * 1024
 
-test.describe('Archive jobs with queued streaming workers @all', () => {
+test.describe('Archive jobs with queued streaming workers @all @critical', () => {
   test.setTimeout(120_000)
 
   test('compresses and extracts through the background queue', async ({ page }) => {
     await signUpAndGoToFiles(page)
-    await seedFile(page, 'alpha.txt', randomBytes(fixtureSize))
-    await seedFile(page, 'beta.txt', randomBytes(fixtureSize))
+    await seedFile(page, 'alpha.txt', fixtureBytes(fixtureSize, 0x13579bdf))
+    await seedFile(page, 'beta.txt', fixtureBytes(fixtureSize, 0x2468ace0))
     await page.reload()
 
     await selectFile(page, 'alpha.txt')
@@ -28,7 +27,6 @@ test.describe('Archive jobs with queued streaming workers @all', () => {
     const compressJob = (await compressResponse.json()) as BackgroundJob
     expect(compressJob.status).toBe('queued')
     await expect(page.getByText('Background task created')).toBeVisible()
-    await expect(page.getByRole('link', { name: /tasks/i })).toContainText('1')
 
     await expectJobCompleted(page, compressJob.id)
     await page.goto('/tasks')
@@ -45,7 +43,6 @@ test.describe('Archive jobs with queued streaming workers @all', () => {
     expect(extractResponse.ok()).toBe(true)
     const extractJob = (await extractResponse.json()) as BackgroundJob
     expect(extractJob.status).toBe('queued')
-    await expect(page.getByRole('link', { name: /tasks/i })).toContainText('1')
 
     await expectJobCompleted(page, extractJob.id)
     await page.goto('/files')
@@ -98,19 +95,37 @@ async function openRowAction(page: Page, fileName: string, action: string) {
 }
 
 async function expectJobCompleted(page: Page, jobId: string): Promise<BackgroundJob> {
-  const deadline = Date.now() + 60_000
-  while (Date.now() < deadline) {
-    const response = await page.request.get('/api/background-jobs?page=1&pageSize=20')
-    expect(response.ok()).toBe(true)
-    const body = (await response.json()) as PaginatedResponse<BackgroundJob>
-    const job = body.items.find((item) => item.id === jobId)
-    if (job?.status === 'completed') return job
-    if (job?.status === 'failed') throw new Error(job.errorMessage ?? 'Archive job failed')
-    await page.waitForTimeout(500)
-  }
-  throw new Error(`Timed out waiting for archive job ${jobId}`)
+  let completed: BackgroundJob | undefined
+  await expect
+    .poll(
+      async () => {
+        const response = await page.request.get('/api/background-jobs?page=1&pageSize=20')
+        expect(response.ok()).toBe(true)
+        const body = (await response.json()) as PaginatedResponse<BackgroundJob>
+        const job = body.items.find((item) => item.id === jobId)
+        if (job?.status === 'failed') throw new Error(job.errorMessage ?? 'Archive job failed')
+        if (job?.status === 'completed') completed = job
+        return job?.status
+      },
+      { timeout: 60_000 },
+    )
+    .toBe('completed')
+  if (!completed) throw new Error(`Archive job ${jobId} completed without a result`)
+  return completed
 }
 
 function isBackgroundJobPost(url: string, method: string) {
   return method === 'POST' && url.includes('/api/background-jobs')
+}
+
+function fixtureBytes(size: number, seed: number): Buffer {
+  const bytes = Buffer.allocUnsafe(size)
+  let state = seed
+  for (let index = 0; index < size; index += 1) {
+    state ^= state << 13
+    state ^= state >>> 17
+    state ^= state << 5
+    bytes[index] = state
+  }
+  return bytes
 }

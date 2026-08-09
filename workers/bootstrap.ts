@@ -146,8 +146,8 @@ export default {
   },
 
   async queue(batch: MessageBatch<ArchiveJobMessage>, env: Env): Promise<void> {
-    const platform = createCloudflarePlatform(env)
-    const archiveJobs = createArchiveJobsGateway(platform)
+    const runtime = runtimeFor(env)
+    const archiveJobs = createArchiveJobsGateway(runtime.platform)
     for (const message of batch.messages) {
       await archiveJobs.runMessage(message.body)
       message.ack()
