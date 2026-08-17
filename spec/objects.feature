@@ -45,7 +45,8 @@ Feature: Objects
   Scenario: Object creation records the authenticated actor
     Given an authenticated user, API key, agent, or device
     When that actor creates an object
-    Then the object stores the stable actor identity and returns its display profile
+    Then the object stores and returns the stable actor identity
+    And its display profile is available from the creator subresource
 
   @objects/legacy-creator @api
   Scenario: Historical objects do not impersonate the workspace owner
@@ -70,6 +71,18 @@ Feature: Objects
     Given a configured storage
     When a file object is created
     Then a draft with upload instructions (part size + presigned URLs) is returned
+
+  @objects/create-capacity-offer @api
+  Scenario: Creating a file over quota offers an immediate capacity upgrade
+    Given a file would exceed the workspace quota and a larger published plan is available
+    When the file object is created
+    Then the API responds 402 with the eligible capacity offer and a purchase request hash
+
+  @objects/create-capacity-unavailable @api
+  Scenario: Creating a file over quota fails when no immediate capacity upgrade exists
+    Given a file would exceed the workspace quota and no published plan can close the gap
+    When the file object is created
+    Then the API responds 422 without a payment offer
 
   @objects/create-file-too-large @api
   Scenario: Creating an oversized file is rejected
